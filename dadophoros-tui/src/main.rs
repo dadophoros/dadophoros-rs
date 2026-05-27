@@ -78,9 +78,39 @@ fn setup_panic_hook() {
     }));
 }
 
+struct Aggregate {
+    event: EnrichedEvent, // latest representative; verdict/rule may shift
+    count: u32,
+    last_ts: u64,
+}
+
+#[derive(Default, PartialEq, Eq, Clone)]
+struct AggKey {
+    pid: u32,
+    comm: String,
+    exe: String,
+    host_or_ip: String,
+    port: u16,
+}
+
+impl AggKey {
+    fn of(ev: &EnrichedEvent) -> Self {
+        Self {
+            pid: ev.pid,
+            comm: ev.comm.clone(),
+            exe: ev.exe_path.clone().unwrap_or_default(),
+            host_or_ip: ev
+                .hostname
+                .clone()
+                .unwrap_or_else(|| format_addr(ev)),
+            port: ev.dport,
+        }
+    }
+}
+
 #[derive(Default)]
 struct App {
-    events: VecDeque<EnrichedEvent>,
+    events: VecDeque<Aggregate>,
     state: TableState,
     follow: bool,
     filter: String,
@@ -100,10 +130,26 @@ impl App {
     }
 
     fn push(&mut self, ev: EnrichedEvent) {
+        let key = AggKey::of(&ev);
+        let ts = ev.ts_unix_ns;
+        if let Some(agg) = self
+            .events
+            .iter_mut()
+            .find(|a| AggKey::of(&a.event) == key)
+        {
+            agg.count += 1;
+            agg.last_ts = ts;
+            agg.event = ev;
+            return;
+        }
         if self.events.len() == MAX_EVENTS {
             self.events.pop_front();
         }
-        self.events.push_back(ev);
+        self.events.push_back(Aggregate {
+            event: ev,
+            count: 1,
+            last_ts: ts,
+        });
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -114,7 +160,7 @@ impl App {
             self.events
                 .iter()
                 .enumerate()
-                .filter(|(_, ev)| event_matches(ev, &needle))
+                .filter(|(_, a)| event_matches(&a.event, &needle))
                 .map(|(i, _)| i)
                 .collect()
         }
@@ -277,7 +323,8 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     let rows: Vec<Row> = indices
         .iter()
         .map(|&i| {
-            let ev = &app.events[i];
+            let agg = &app.events[i];
+            let ev = &agg.event;
             let host_or_ip = ev
                 .hostname
                 .as_deref()
@@ -293,6 +340,11 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
                 dadophoros_proto::Verdict::Deny => "deny",
             };
             let rule = ev.matched_rule.clone().unwrap_or_else(|| "-".to_string());
+            let count = if agg.count > 1 {
+                format!("×{}", agg.count)
+            } else {
+                String::new()
+            };
             let style = if ev.verdict == dadophoros_proto::Verdict::Deny {
                 Style::default().fg(Color::Red)
             } else {
@@ -306,13 +358,16 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(ev.dport.to_string()),
                 Cell::from(verdict),
                 Cell::from(rule),
+                Cell::from(count).style(Style::default().fg(Color::Cyan)),
             ])
             .style(style)
         })
         .collect();
 
-    let header = Row::new(vec!["PID", "COMM", "EXE", "HOST", "PORT", "VERDICT", "RULE"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = Row::new(vec![
+        "PID", "COMM", "EXE", "HOST", "PORT", "VERDICT", "RULE", "N",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
 
     let table = Table::new(
         rows,
@@ -324,6 +379,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(6),
             Constraint::Length(8),
             Constraint::Length(16),
+            Constraint::Length(6),
         ],
     )
     .header(header)
