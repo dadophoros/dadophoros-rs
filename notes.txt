@@ -70,3 +70,5 @@
 
   -----
 
+cargo test --workspace --release
+

@@ -9,3 +9,6 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }

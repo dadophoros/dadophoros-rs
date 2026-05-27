@@ -108,3 +108,107 @@ where
     writer.flush().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event() -> EnrichedEvent {
+        EnrichedEvent {
+            ts_unix_ns: 1_700_000_000_000_000_000,
+            pid: 42,
+            uid: 1000,
+            comm: "curl".into(),
+            exe_path: Some("/usr/bin/curl".into()),
+            family: 4,
+            daddr_v4: 0x0403_02_01,
+            daddr_v6: [0; 16],
+            dport: 443,
+            hostname: Some("github.com".into()),
+            verdict: Verdict::Deny,
+            matched_rule: Some("block-github".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_subscribe_no_filter() {
+        let (mut w, mut r) = tokio::io::duplex(1024);
+        let msg = ClientMessage::Subscribe { filter: None };
+        write_message(&mut w, &msg).await.unwrap();
+        drop(w);
+        let got: ClientMessage = read_message(&mut r).await.unwrap();
+        assert!(matches!(got, ClientMessage::Subscribe { filter: None }));
+    }
+
+    #[tokio::test]
+    async fn roundtrip_subscribe_with_filter() {
+        let filter = EventFilter {
+            process_path_contains: Some("firefox".into()),
+            host_contains: Some(".github.com".into()),
+        };
+        let msg = ClientMessage::Subscribe {
+            filter: Some(filter),
+        };
+        let (mut w, mut r) = tokio::io::duplex(1024);
+        write_message(&mut w, &msg).await.unwrap();
+        drop(w);
+        let got: ClientMessage = read_message(&mut r).await.unwrap();
+        let ClientMessage::Subscribe { filter: Some(f) } = got else {
+            panic!("expected subscribe with filter");
+        };
+        assert_eq!(f.process_path_contains.as_deref(), Some("firefox"));
+        assert_eq!(f.host_contains.as_deref(), Some(".github.com"));
+    }
+
+    #[tokio::test]
+    async fn roundtrip_event() {
+        let original = sample_event();
+        let (mut w, mut r) = tokio::io::duplex(2048);
+        write_message(&mut w, &ServerMessage::Event(original.clone()))
+            .await
+            .unwrap();
+        drop(w);
+        let got: ServerMessage = read_message(&mut r).await.unwrap();
+        let ServerMessage::Event(ev) = got else {
+            panic!("expected Event");
+        };
+        assert_eq!(ev.pid, original.pid);
+        assert_eq!(ev.comm, original.comm);
+        assert_eq!(ev.exe_path, original.exe_path);
+        assert_eq!(ev.dport, original.dport);
+        assert_eq!(ev.verdict, original.verdict);
+        assert_eq!(ev.matched_rule, original.matched_rule);
+        assert_eq!(ev.daddr_v4, original.daddr_v4);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_multiple_messages_back_to_back() {
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        write_message(&mut w, &ServerMessage::Hello { daemon_version: "1.2.3".into() })
+            .await
+            .unwrap();
+        write_message(&mut w, &ServerMessage::Ok).await.unwrap();
+        write_message(&mut w, &ServerMessage::Event(sample_event()))
+            .await
+            .unwrap();
+        drop(w);
+
+        let m1: ServerMessage = read_message(&mut r).await.unwrap();
+        assert!(matches!(m1, ServerMessage::Hello { .. }));
+        let m2: ServerMessage = read_message(&mut r).await.unwrap();
+        assert!(matches!(m2, ServerMessage::Ok));
+        let m3: ServerMessage = read_message(&mut r).await.unwrap();
+        assert!(matches!(m3, ServerMessage::Event(_)));
+    }
+
+    #[tokio::test]
+    async fn read_short_frame_errors() {
+        // 4-byte length prefix says 100 bytes follow; we close after writing none.
+        let (mut w, mut r) = tokio::io::duplex(1024);
+        use tokio::io::AsyncWriteExt;
+        w.write_all(&100u32.to_be_bytes()).await.unwrap();
+        drop(w);
+        let err = read_message::<_, ServerMessage>(&mut r).await.unwrap_err();
+        assert!(matches!(err, ProtoError::Io(_)));
+    }
+}

@@ -392,6 +392,75 @@ fn comm_str(buf: &[u8; 16]) -> &str {
     std::str::from_utf8(&buf[..end]).unwrap_or("?")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn comm_str_stops_at_null() {
+        let buf = *b"curl\0extra-bytes";
+        assert_eq!(comm_str(&buf), "curl");
+    }
+
+    #[test]
+    fn comm_str_empty_buffer() {
+        let buf = [0u8; 16];
+        assert_eq!(comm_str(&buf), "");
+    }
+
+    #[test]
+    fn comm_str_full_buffer_no_null() {
+        let buf = *b"abcdefghijklmnop";
+        assert_eq!(comm_str(&buf), "abcdefghijklmnop");
+    }
+
+    fn ev(family: u8, daddr_v4: u32, daddr_v6: [u8; 16]) -> ConnectEvent {
+        ConnectEvent {
+            pid: 0,
+            uid: 0,
+            daddr_v4,
+            daddr_v6,
+            dport: 443,
+            family,
+            _pad: 0,
+            comm: [0; 16],
+        }
+    }
+
+    #[test]
+    fn connect_event_ip_v4_decodes_network_order() {
+        // user_ip4 holds the raw __be32: bytes in memory are network order.
+        // For 1.2.3.4 those bytes are [0x01, 0x02, 0x03, 0x04]. On a LE host
+        // the u32 value is 0x04030201.
+        let e = ev(4, 0x04030201, [0; 16]);
+        let ip = connect_event_ip(&e).unwrap();
+        assert_eq!(ip, IpAddr::V4("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn connect_event_ip_v6_returns_addr_from_bytes() {
+        let bytes: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        let e = ev(6, 0, bytes);
+        let ip = connect_event_ip(&e).unwrap();
+        assert_eq!(ip, IpAddr::V6("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn connect_event_ip_zero_v4_is_none() {
+        let e = ev(4, 0, [0; 16]);
+        assert!(connect_event_ip(&e).is_none());
+    }
+
+    #[test]
+    fn connect_event_ip_unknown_family_is_none() {
+        let e = ev(255, 0, [0; 16]);
+        assert!(connect_event_ip(&e).is_none());
+    }
+}
+
 fn enrich(
     e: &ConnectEvent,
     exe: Option<&str>,

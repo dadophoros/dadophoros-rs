@@ -439,3 +439,132 @@ fn short_path(p: &str) -> String {
         _ => p.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dadophoros_proto::Verdict;
+
+    fn make_event(
+        pid: u32,
+        comm: &str,
+        host: Option<&str>,
+        port: u16,
+        verdict: Verdict,
+    ) -> EnrichedEvent {
+        EnrichedEvent {
+            ts_unix_ns: 0,
+            pid,
+            uid: 1000,
+            comm: comm.to_string(),
+            exe_path: Some(format!("/usr/bin/{comm}")),
+            family: 4,
+            // 4.3.2.1 in network-order bytes; LE host reads as 0x01020304.
+            daddr_v4: 0x01020304,
+            daddr_v6: [0; 16],
+            dport: port,
+            hostname: host.map(str::to_owned),
+            verdict,
+            matched_rule: None,
+        }
+    }
+
+    #[test]
+    fn push_appends_first_event() {
+        let mut app = App::new("test".into());
+        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
+        assert_eq!(app.events.len(), 1);
+        assert_eq!(app.events[0].count, 1);
+    }
+
+    #[test]
+    fn push_dedupes_same_tuple() {
+        let mut app = App::new("test".into());
+        for _ in 0..5 {
+            app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
+        }
+        assert_eq!(app.events.len(), 1);
+        assert_eq!(app.events[0].count, 5);
+    }
+
+    #[test]
+    fn push_distinguishes_different_ports() {
+        let mut app = App::new("test".into());
+        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
+        app.push(make_event(1, "curl", Some("github.com"), 80, Verdict::Allow));
+        assert_eq!(app.events.len(), 2);
+        assert!(app.events.iter().all(|a| a.count == 1));
+    }
+
+    #[test]
+    fn push_distinguishes_different_comm_threads() {
+        // Firefox's "DNS Res~er #112" vs "DNS Res~er #102" — same pid, same
+        // exe, same host/port but different thread names — should remain
+        // separate rows.
+        let mut app = App::new("test".into());
+        app.push(make_event(1, "DNS Res~er #112", Some("127.0.0.53"), 53, Verdict::Allow));
+        app.push(make_event(1, "DNS Res~er #102", Some("127.0.0.53"), 53, Verdict::Allow));
+        assert_eq!(app.events.len(), 2);
+    }
+
+    #[test]
+    fn push_updates_latest_verdict_on_dedup() {
+        let mut app = App::new("test".into());
+        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
+        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Deny));
+        assert_eq!(app.events.len(), 1);
+        assert_eq!(app.events[0].count, 2);
+        assert_eq!(app.events[0].event.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn agg_key_falls_back_to_ip_when_no_hostname() {
+        let mut ev = make_event(1, "curl", None, 443, Verdict::Allow);
+        ev.daddr_v4 = 0x04030201; // 1.2.3.4 in network-order bytes
+        let key = AggKey::of(&ev);
+        assert_eq!(key.host_or_ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn agg_key_uses_hostname_when_present() {
+        let ev = make_event(1, "curl", Some("github.com"), 443, Verdict::Allow);
+        let key = AggKey::of(&ev);
+        assert_eq!(key.host_or_ip, "github.com");
+    }
+
+    #[test]
+    fn short_path_basename_when_no_slash() {
+        assert_eq!(short_path("foo"), "foo");
+    }
+
+    #[test]
+    fn short_path_two_segment_path() {
+        assert_eq!(short_path("/usr/bin/curl"), ".../bin/curl");
+    }
+
+    #[test]
+    fn short_path_deep_path() {
+        assert_eq!(
+            short_path("/snap/firefox/7901/usr/lib/firefox/firefox"),
+            ".../firefox/firefox"
+        );
+    }
+
+    #[test]
+    fn event_matches_substring_case_insensitive() {
+        let ev = make_event(1, "Firefox", Some("MAIL.GOOGLE.com"), 443, Verdict::Allow);
+        assert!(event_matches(&ev, "google"));
+        assert!(event_matches(&ev, "firefox"));
+        assert!(!event_matches(&ev, "github"));
+    }
+
+    #[test]
+    fn filter_narrows_visible_rows() {
+        let mut app = App::new("test".into());
+        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
+        app.push(make_event(2, "firefox", Some("example.com"), 443, Verdict::Allow));
+        assert_eq!(app.filtered_indices().len(), 2);
+        app.filter = "github".into();
+        assert_eq!(app.filtered_indices().len(), 1);
+    }
+}
