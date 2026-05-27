@@ -1,0 +1,40 @@
+[package]
+name = "dadophoros-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.1"
+dadophoros-common = { path = "../dadophoros-common", default-features = false }
+
+[[bin]]
+name = "dadophoros-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+debug = false
+debug-assertions = false
+overflow-checks = false
+panic = "abort"
+codegen-units = 1
+rpath = false
+
+[workspace]
+# Explicit empty workspace: this crate is its own workspace, deliberately
+# isolated from the parent so the stable parent build does not attempt
+# to compile it for the wrong target.

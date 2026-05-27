@@ -1,0 +1,11 @@
+[package]
+name = "dadophoros-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+tokio = { version = "1", features = ["io-util"] }

@@ -1,0 +1,72 @@
+
+
+
+  - Workspace (Cargo.toml, .cargo/config.toml): excludes dadophoros-ebpf, aliases cargo xtask to the build orchestrator
+  - dadophoros-common: no_std ConnectEvent (48 bytes, bytemuck::Pod under user feature)
+  - dadophoros-ebpf: 4 cgroup hooks (connect4/6, sendmsg4/6) emitting to 256 KiB EVENTS ringbuf; isolated workspace so the stable parent build never touches it
+  - dadophoros-daemon (dadophorosd): tokio current-thread loop, attaches all 4 hooks to /sys/fs/cgroup, AsyncFd-wrapped ringbuf drain, prints pid=N uid=N comm=X -> IP:port per event
+  - xtask: build-ebpf and build subcommands; scrubs RUSTC/CARGO/RUSTUP_TOOLCHAIN before shelling out so the child cargo actually picks up nightly from the ebpf crate's
+  rust-toolchain.toml
+
+----------------
+
+● One-time setup:
+  rustup toolchain install nightly
+  rustup component add rust-src --toolchain nightly
+  cargo install bpf-linker
+
+  Build:
+  cargo xtask build-ebpf --release   # nightly + bpfel-unknown-none, produces target/bpfel-unknown-none/release/dadophoros-ebpf
+  cargo build --release              # stable, produces target/release/dadophorosd (embeds the eBPF ELF via include_bytes_aligned!)
+
+  Or chain both: cargo xtask build --release.
+
+  Run:
+  sudo target/release/dadophorosd
+
+  After editing dadophoros-ebpf/src/* rerun cargo xtask build-ebpf --release then cargo build --release -p dadophoros-daemon (rustc tracks the
+   include_bytes! dep, so it'll re-link). Userspace-only edits just need cargo build --release.
+
+-----------------
+
+
+● Yes. The eBPF crate compiles to an ELF object (~7KB of BPF bytecode + map definitions) which is embedded into the daemon binary at compile
+  time via include_bytes_aligned!. At runtime the daemon:
+
+  1. Ebpf::load(EBPF_OBJ) — parses the ELF and creates the maps (EVENTS ringbuf) via the bpf() syscall
+  2. prog.load() — submits each program to the kernel; the verifier runs here
+  3. prog.attach(&cgroup, ...) — links the loaded program to /sys/fs/cgroup so the kernel actually invokes it on connect/sendmsg
+
+  The programs and maps live in the kernel only as long as the daemon holds the fds. On Ctrl-C or any exit, the kernel reclaims them. No
+  persistent kernel install, no module loading — pure ephemeral attach. The eBPF crate is purely a build artifact source; you never run it
+  directly.
+
+-----------------
+
+  Concretely, cargo xtask build-ebpf --release:
+  1. Locates the workspace root
+  2. cds into dadophoros-ebpf/
+  3. Scrubs RUSTC/CARGO/RUSTUP_TOOLCHAIN from env (else the inherited parent-cargo env forces stable on the child)
+  4. Sets CARGO_TARGET_DIR=workspace/target so the ELF lands where the daemon's include_bytes_aligned! expects it
+  5. Shells out cargo build --release — at which point rustup proxy reads dadophoros-ebpf/rust-toolchain.toml, picks nightly, sees
+  .cargo/config.toml saying target=bpfel-unknown-none and build-std=core, and builds correctly
+
+  It's not doing kernel/runtime work; it's purely a glue script in Rust that compiles fast and ships in the workspace.
+
+---------------
+
+❯ why do we need nightly cargo?
+
+● Two reasons, both forced by bpfel-unknown-none:
+
+  1. -Z build-std=core is unstable. bpfel-unknown-none is a tier-3 target — rustup doesn't ship a precompiled core for it. We have to build
+  core from source using rust-src, and the build-std cargo flag that triggers this is nightly-only.
+  2. Some BPF-target codegen relies on nightly features. Aya-ebpf and the proc macros (#[cgroup_sock_addr], #[map], etc.) historically lean on
+   a few unstable bits to emit the right ELF sections and inline-asm in some places.
+
+  That's it — neither is a runtime requirement, it's purely the build-time toolchain. The daemon and xtask happily compile on stable; only the
+   kernel-side crate is nightly. This is why the spec explicitly carves out "MSRV: stable for daemon and TUI, nightly for the eBPF crate" and
+  why the crate lives in its own little workspace with its own rust-toolchain.toml.
+
+  -----
+

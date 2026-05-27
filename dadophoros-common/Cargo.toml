@@ -1,0 +1,13 @@
+[package]
+name = "dadophoros-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+user = ["dep:bytemuck"]
+
+[dependencies]
+bytemuck = { version = "1.16", features = ["derive"], optional = true }
