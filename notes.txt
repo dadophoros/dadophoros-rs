@@ -72,3 +72,25 @@
 
 cargo test --workspace --release
 
+-----
+
+❯ curious: is doing something like this at all possible on MacOS?
+
+● Yes, but the architecture is completely different — there's no eBPF on macOS. The Apple-sanctioned equivalent is the Network Extensions framework
+   (NEFilterDataProvider for connection-level allow/deny, NEAppProxyProvider for transparent proxy-style flow control, NEFilterPacketProvider for
+  packet-level inspection). Instead of loading a kernel program, you ship a system extension bundle (.systemextension) that runs in userspace with
+  a special entitlement (com.apple.developer.networking.networkextension), receives every connect() as a callback, and returns a verdict.
+
+  Process attribution comes via the Endpoint Security framework (es_event_type_t::ES_EVENT_TYPE_AUTH_EXEC for new processes) plus the connection's
+  audit token, which gives you the bundle ID / signing identity directly — actually cleaner than what we get from eBPF's task->comm. There's no
+  tc/clsact equivalent for DNS sniffing, but the resolver context arrives attached to flows in many cases, so you don't always need to sniff.
+
+  The big practical differences:
+  - Codesigning + notarization required. Network/System extensions can't run unsigned; you need an Apple developer account ($99/yr) and a
+  com.apple.developer.networking.networkextension provisioning entitlement that requires a separate Apple approval step.
+  - No kernel-side cache. Every flow round-trips to your userspace extension via XPC, which is slower than eBPF's in-kernel verdict cache, but
+  Apple's framework is fast enough for desktop use.
+  - No connect() hook for UDP sendmsg-style sockets in older OS versions; coverage tightened over time.
+
+  The reference open-source projects to look at are LuLu (Patrick Wardle, free, uses NEFilterDataProvider) and Little Snitch (commercial,
+  polished). Architecturally similar mission to dadophoros, totally different plumbing.
