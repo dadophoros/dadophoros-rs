@@ -4,8 +4,9 @@
 > the procession so others could see where they were going.*
 
 An eBPF-based outbound connection observer and policy engine for Linux.
-Watches every `connect()` syscall on the host, attributes it to a process
-and a destination domain, displays it in a TUI, and (eventually) enforces
+Watches outbound socket activity (`connect()` for TCP/connected UDP and
+`sendmsg`/`sendto` for unconnected UDP), attributes it to a process and a
+destination domain, displays it in a TUI, and (eventually) enforces
 allow-list policies in-kernel.
 
 ## Goals
@@ -16,7 +17,7 @@ allow-list policies in-kernel.
    from packages you just installed.
 2. **Allow-list enforcement.** Configure a default-deny policy and an
    explicit allow-list of (process, domain) pairs. Block everything else
-   in-kernel via the cgroup connect hook's verdict return.
+   in-kernel via the cgroup connect/sendmsg hooks' verdict return.
 
 The two goals share most of an implementation. v1 focuses on goal 1;
 goal 2 is staged in deliberately once observation is solid.
@@ -37,22 +38,40 @@ goal 2 is staged in deliberately once observation is solid.
   programs, TUI client.
 - **eBPF library: Aya.** Not libbpf-rs. The reason is build-time simplicity
   (no C toolchain dependency) and the pure-Rust eBPF program path.
-- **Primary interception: `cgroup/connect4` and `cgroup/connect6`.**
-  Attached to the root cgroup at `/sys/fs/cgroup`. Verdict returned
-  directly from the kernel-side program. Not NFQUEUE.
+- **Primary interception: `cgroup/connect4` and `cgroup/connect6` for TCP
+  and connected UDP; `cgroup/sendmsg4` and `cgroup/sendmsg6` for
+  unconnected UDP egress.** Attached to the root cgroup at
+  `/sys/fs/cgroup`. Verdict returned directly from the kernel-side
+  program. Events from the sendmsg hooks are deduplicated in userspace by
+  `FlowKey`, so a UDP socket that is both `connect()`'d and used with
+  `sendmsg` produces only one event per flow. Not NFQUEUE.
 - **Event transport: BPF ringbuf.** Not perf event array. Kernel 5.8+ only.
-- **Process attribution: `bpf_get_current_pid_tgid()` in the connect hook,
-  enriched by a `sys_enter_execve` tracepoint that populates a
-  `pid → ProcessInfo` map.** Not `/proc` walking from userspace.
+- **Process attribution: `bpf_get_current_pid_tgid()` in the connect and
+  sendmsg hooks, enriched by `sys_enter_execve` and `sched_process_fork`
+  tracepoints that populate a `pid → ProcessInfo` map.** Not `/proc`
+  walking from userspace (except for a one-shot backfill at startup).
 - **DNS correlation: userspace, sniffing via `tc/egress` and `tc/ingress`
   programs filtering UDP/53 and TCP/53, parsed with `hickory-proto`.**
+  Programs are attached to `lo` (to catch stub-resolver traffic such as
+  systemd-resolved on `127.0.0.53`) and to every UP non-virtual
+  interface, refreshed on link state changes via an rtnetlink listener.
   Cache lives in userspace, keyed by destination IP, with TTL eviction.
 - **Verdict cache: `LruHashMap<FlowKey, Verdict>` in the kernel.**
-  Cgroup hook checks cache; cache miss emits event and (in v1) allows;
-  in later stages, cache miss blocks pending userspace decision.
+  Cgroup hook checks cache; cache miss emits event and (in observe mode)
+  allows. In enforce mode, cache miss returns deny synchronously (see
+  "Enforcement model" below).
+- **Enforcement model: synchronous deny + cache + retry.** cgroup/connect
+  and cgroup/sendmsg hooks cannot sleep. In enforce mode, a cache miss
+  returns deny — the syscall fails with `EPERM` — the daemon emits a
+  `PendingVerdict` to subscribed TUIs, and the user's decision is written
+  to `VERDICT_CACHE` for next time. The user re-runs the action to test
+  the new verdict. There is no transparent retry; applications that don't
+  retry on `EPERM` will simply fail until the verdict is cached and the
+  action is rerun. This is the OpenSnitch UX model; document it as the
+  intended behavior, not a limitation.
 - **IPC: Unix socket with length-prefixed binary protocol.** Not gRPC.
-  `bincode` or `postcard` serialization. Daemon owns the socket at
-  `/run/dadophoros.sock`.
+  `postcard` serialization (stable wire format, no_std-compatible).
+  Daemon owns the socket at `/run/dadophoros.sock`.
 - **TUI: `ratatui` + `crossterm`.** Separate binary from the daemon.
 - **Rule storage: JSON or TOML files under `/etc/dadophoros/rules.d/`,
   one rule per file.** Grep-able, diff-able, version-controllable.
@@ -66,22 +85,24 @@ goal 2 is staged in deliberately once observation is solid.
 
 ```
 dadophoros/
-├── Cargo.toml                  # workspace root
+├── Cargo.toml                  # workspace root (excludes dadophoros-ebpf)
 ├── README.md
 ├── LICENSE                     # MIT OR Apache-2.0 dual
 ├── docs/
 │   ├── architecture.md
 │   ├── building.md
 │   └── rules.md
+├── xtask/                      # build orchestration
+│   ├── Cargo.toml
+│   └── src/main.rs             # invokes nightly cargo for dadophoros-ebpf
 ├── dadophoros-common/          # shared types between kernel + userspace
 │   └── src/lib.rs
-├── dadophoros-ebpf/            # kernel-side BPF programs
+├── dadophoros-ebpf/            # kernel-side BPF programs (built via xtask)
 │   ├── .cargo/config.toml      # pins target to bpfel-unknown-none
 │   ├── Cargo.toml
 │   └── src/main.rs
 ├── dadophoros-daemon/          # privileged userspace daemon (`dadophorosd`)
 │   ├── Cargo.toml
-│   ├── build.rs                # builds the ebpf crate, embeds the object
 │   └── src/
 │       ├── main.rs
 │       ├── loader.rs           # eBPF program load + attach
@@ -146,6 +167,8 @@ pub struct ProcessInfo {
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct FlowKey {
     pub pid: u32,
+    pub _pad0: u32,                // align start_ns to 8 bytes
+    pub start_ns: u64,             // task->start_boottime, via CO-RE; defeats PID reuse
     pub daddr_v4: u32,
     pub daddr_v6: [u8; 16],
     pub dport: u16,
@@ -167,22 +190,35 @@ asserts on every shared struct to catch silent layout drift.
 
 ## Kernel-side programs (`dadophoros-ebpf`)
 
-Five programs, all in the same eBPF object:
+Nine programs in seven items (grouped where they share logic), all in
+the same eBPF object:
 
-1. **`cgroup/connect4`** — fires on every IPv4 `connect()`. Builds a
-   `FlowKey`, checks `VERDICT_CACHE`, emits a `ConnectEvent` to `EVENTS`
-   ringbuf if uncached. Returns 1 (allow) or 0 (deny) based on cache.
+1. **`cgroup/connect4`** — fires on every IPv4 `connect()` (TCP and
+   connected UDP). Builds a `FlowKey` — reading `start_ns` from
+   `task_struct->start_boottime` via CO-RE so PID reuse cannot alias —
+   checks `VERDICT_CACHE`, emits a `ConnectEvent` to `EVENTS` ringbuf
+   if uncached. Returns 1 (allow) or 0 (deny) based on cache.
 2. **`cgroup/connect6`** — IPv6 equivalent. Shares logic via inlined helper.
-3. **`tracepoint/syscalls/sys_enter_execve`** — populates `PROCESS_INFO`
+3. **`cgroup/sendmsg4` + `cgroup/sendmsg6`** — fire on UDP `sendto`/
+   `sendmsg` to unconnected sockets. Same `FlowKey` construction and
+   cache check as connect4/6. Required to cover QUIC, mDNS, NTP, and
+   other UDP egress that bypasses `connect()`. Userspace deduplicates
+   against the connect path by `FlowKey`.
+4. **`tracepoint/syscalls/sys_enter_execve`** — populates `PROCESS_INFO`
    with the new process's metadata. Reads exe path via the filename
    argument; truncates to a fixed buffer.
-4. **`tracepoint/sched/sched_process_exit`** — marks `PROCESS_INFO`
+5. **`tracepoint/sched/sched_process_fork`** — copies
+   `PROCESS_INFO[parent_pid]` into `PROCESS_INFO[child_pid]`. Required
+   so forked workers that `connect()` without `execve` are attributed
+   to their parent's exe path rather than left unresolved.
+6. **`tracepoint/sched/sched_process_exit`** — marks `PROCESS_INFO`
    entries for deletion with a grace period (don't delete immediately;
    short-lived processes can have pending events in flight).
-5. **`tc/egress` + `tc/ingress` on the default route interface** — clones
-   UDP/53 and TCP/53 packets into a `DNS_EVENTS` ringbuf for userspace
-   parsing. Attached programmatically by the daemon at startup,
-   redetected if the default route changes.
+7. **`tc/egress` + `tc/ingress`** — clone UDP/53 and TCP/53 packets
+   into a `DNS_EVENTS` ringbuf for userspace parsing. Attached to `lo`
+   (to catch stub-resolver traffic such as systemd-resolved on
+   `127.0.0.53`) and to every UP non-virtual interface, refreshed on
+   link state changes via an rtnetlink listener in the daemon.
 
 Maps:
 
@@ -256,7 +292,7 @@ rule matches is configured globally: `mode = "observe" | "enforce"`.
 
 ### IPC protocol
 
-Length-prefixed (4-byte big-endian length, then bincode-serialized
+Length-prefixed (4-byte big-endian length, then postcard-serialized
 `Message`). Bidirectional. Types live in `dadophoros-proto`:
 
 ```rust
@@ -320,24 +356,30 @@ benefits from real traffic patterns at each layer.
 
 ### Step 1 — Minimal observation
 
-Already prototyped. `dadophoros-common`, `dadophoros-ebpf` with just
-`connect4` + `connect6` and `EVENTS` ringbuf, `dadophoros-daemon` that
-loads the program, attaches to root cgroup, drains events, prints to
-stdout. No DNS, no enrichment beyond `comm`, no rules, no TUI.
+`dadophoros-common`, `dadophoros-ebpf` with `connect4`, `connect6`,
+`sendmsg4`, `sendmsg6` and the `EVENTS` ringbuf, `dadophoros-daemon`
+that loads the program, attaches to root cgroup, drains events, prints
+to stdout. No DNS, no enrichment beyond `comm`, no rules, no TUI. (A
+connect-only prototype already exists outside this repo; this step
+ports it in and adds the sendmsg hooks alongside.)
 
 Acceptance: `sudo dadophorosd` prints lines like
 `pid=12453 uid=1000 comm=curl -> 140.82.121.4:443` for every outbound
-connection on the machine.
+TCP/connected-UDP connection and every UDP `sendto`/`sendmsg` on the
+machine.
 
 ### Step 2 — Process attribution
 
-Add `sys_enter_execve` and `sched_process_exit` tracepoints,
-`PROCESS_INFO` map, `/proc` backfill on startup. Enrich events in
-userspace with exe path. Output gains the `exe=/usr/bin/curl` column.
+Add `sys_enter_execve`, `sched_process_fork`, and `sched_process_exit`
+tracepoints, `PROCESS_INFO` map, `/proc` backfill on startup. Enrich
+events in userspace with exe path. Output gains the
+`exe=/usr/bin/curl` column.
 
 Acceptance: connections from short-lived processes (e.g.
 `bash -c 'curl example.com'`) show the correct exe path, not just
-the bash invocation.
+the bash invocation. Fork-without-exec children (e.g. a worker pool
+in a long-running Python daemon) are attributed to the parent's
+exe path, not left unresolved.
 
 ### Step 3 — DNS correlation
 
@@ -346,7 +388,8 @@ ringbuf. Userspace DNS cache with TTL eviction. Events gain
 `host=github.com` when the DNS cache has a match.
 
 Acceptance: a `curl https://github.com` shows the hostname in the
-output, not just the resolved IP.
+output, not just the resolved IP. DNS via systemd-resolved
+(`127.0.0.53`) is also resolved to hostnames.
 
 ### Step 4 — Rules and verdict matching (observe mode)
 
@@ -369,14 +412,20 @@ scrollable table, with filtering.
 
 ### Step 6 — Enforcement
 
-Flip a config flag and the cgroup hook starts returning 0 for cached
-denies. Add the pending-verdict flow: cache miss in enforce mode emits
-event, daemon sends `PendingVerdict` to subscribed TUIs, user decides,
-TUI sends `DecideVerdict`, daemon writes the verdict, application
-retries succeed (or fail permanently).
+Flip a config flag and the cgroup hooks start returning 0 for cached
+denies *and* for cache misses (default-deny on unknowns). Add the
+pending-verdict flow: cache miss in enforce mode emits event and
+returns deny, daemon sends `PendingVerdict` to subscribed TUIs, user
+decides, TUI sends `DecideVerdict`, daemon writes the verdict to
+`VERDICT_CACHE`. The user then re-runs the action so the cached
+verdict applies. There is no in-kernel wait and no transparent retry;
+the original `connect()`/`sendmsg()` has already failed with `EPERM`.
 
-Acceptance: a deny rule actually blocks the connection. An interactive
-prompt in the TUI lets the user allow a previously-unseen flow.
+Acceptance: a deny rule actually blocks the connection. For unseen
+flows, an interactive prompt in the TUI lets the user choose
+allow/deny; the decision is cached, and re-running the action
+succeeds (allow) or continues to fail (deny). Note: the user must
+re-run; there is no transparent retry of the original syscall.
 
 ### Step 7 — Rules view + stats
 
@@ -438,11 +487,17 @@ cargo install bpf-linker
 ### Build
 
 ```sh
+cargo xtask build-ebpf --release
 cargo build --release
 ```
 
-The daemon's `build.rs` invokes the nightly toolchain for the eBPF
-crate; the rest builds on stable.
+`cargo xtask build-ebpf` invokes the nightly toolchain to compile
+`dadophoros-ebpf` for `bpfel-unknown-none` and writes the ELF where
+the daemon's `include_bytes!` expects it. `cargo build --release`
+then builds the daemon and TUI on stable. `cargo xtask build` chains
+both. The `dadophoros-ebpf` crate is intentionally excluded from the
+workspace `members` so the stable parent build does not try to
+compile it with the wrong target.
 
 ### Runtime requirements
 
