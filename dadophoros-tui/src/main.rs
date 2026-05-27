@@ -40,12 +40,9 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("expected Hello, got {other:?}"),
     };
 
-    write_message(
-        &mut writer,
-        &ClientMessage::Subscribe { filter: None },
-    )
-    .await
-    .context("subscribe")?;
+    write_message(&mut writer, &ClientMessage::Subscribe { filter: None })
+        .await
+        .context("subscribe")?;
     let ack: ServerMessage = read_message(&mut reader).await.context("subscribe ack")?;
     if !matches!(ack, ServerMessage::Ok) {
         anyhow::bail!("subscribe failed: {ack:?}");
@@ -99,10 +96,7 @@ impl AggKey {
             pid: ev.pid,
             comm: ev.comm.clone(),
             exe: ev.exe_path.clone().unwrap_or_default(),
-            host_or_ip: ev
-                .hostname
-                .clone()
-                .unwrap_or_else(|| format_addr(ev)),
+            host_or_ip: ev.hostname.clone().unwrap_or_else(|| format_addr(ev)),
             port: ev.dport,
         }
     }
@@ -132,11 +126,7 @@ impl App {
     fn push(&mut self, ev: EnrichedEvent) {
         let key = AggKey::of(&ev);
         let ts = ev.ts_unix_ns;
-        if let Some(agg) = self
-            .events
-            .iter_mut()
-            .find(|a| AggKey::of(&a.event) == key)
-        {
+        if let Some(agg) = self.events.iter_mut().find(|a| AggKey::of(&a.event) == key) {
             agg.count += 1;
             agg.last_ts = ts;
             agg.event = ev;
@@ -177,8 +167,7 @@ impl App {
             .selected()
             .and_then(|sel| indices.iter().position(|&i| i == sel))
             .unwrap_or_else(|| indices.len().saturating_sub(1));
-        let new_pos =
-            (current_pos as isize + delta).clamp(0, indices.len() as isize - 1) as usize;
+        let new_pos = (current_pos as isize + delta).clamp(0, indices.len() as isize - 1) as usize;
         self.state.select(Some(indices[new_pos]));
         self.follow = new_pos == indices.len() - 1;
     }
@@ -472,7 +461,13 @@ mod tests {
     #[test]
     fn push_appends_first_event() {
         let mut app = App::new("test".into());
-        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
+        app.push(make_event(
+            1,
+            "curl",
+            Some("github.com"),
+            443,
+            Verdict::Allow,
+        ));
         assert_eq!(app.events.len(), 1);
         assert_eq!(app.events[0].count, 1);
     }
@@ -481,7 +476,13 @@ mod tests {
     fn push_dedupes_same_tuple() {
         let mut app = App::new("test".into());
         for _ in 0..5 {
-            app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
+            app.push(make_event(
+                1,
+                "curl",
+                Some("github.com"),
+                443,
+                Verdict::Allow,
+            ));
         }
         assert_eq!(app.events.len(), 1);
         assert_eq!(app.events[0].count, 5);
@@ -490,8 +491,20 @@ mod tests {
     #[test]
     fn push_distinguishes_different_ports() {
         let mut app = App::new("test".into());
-        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
-        app.push(make_event(1, "curl", Some("github.com"), 80, Verdict::Allow));
+        app.push(make_event(
+            1,
+            "curl",
+            Some("github.com"),
+            443,
+            Verdict::Allow,
+        ));
+        app.push(make_event(
+            1,
+            "curl",
+            Some("github.com"),
+            80,
+            Verdict::Allow,
+        ));
         assert_eq!(app.events.len(), 2);
         assert!(app.events.iter().all(|a| a.count == 1));
     }
@@ -502,16 +515,40 @@ mod tests {
         // exe, same host/port but different thread names — should remain
         // separate rows.
         let mut app = App::new("test".into());
-        app.push(make_event(1, "DNS Res~er #112", Some("127.0.0.53"), 53, Verdict::Allow));
-        app.push(make_event(1, "DNS Res~er #102", Some("127.0.0.53"), 53, Verdict::Allow));
+        app.push(make_event(
+            1,
+            "DNS Res~er #112",
+            Some("127.0.0.53"),
+            53,
+            Verdict::Allow,
+        ));
+        app.push(make_event(
+            1,
+            "DNS Res~er #102",
+            Some("127.0.0.53"),
+            53,
+            Verdict::Allow,
+        ));
         assert_eq!(app.events.len(), 2);
     }
 
     #[test]
     fn push_updates_latest_verdict_on_dedup() {
         let mut app = App::new("test".into());
-        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
-        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Deny));
+        app.push(make_event(
+            1,
+            "curl",
+            Some("github.com"),
+            443,
+            Verdict::Allow,
+        ));
+        app.push(make_event(
+            1,
+            "curl",
+            Some("github.com"),
+            443,
+            Verdict::Deny,
+        ));
         assert_eq!(app.events.len(), 1);
         assert_eq!(app.events[0].count, 2);
         assert_eq!(app.events[0].event.verdict, Verdict::Deny);
@@ -561,8 +598,20 @@ mod tests {
     #[test]
     fn filter_narrows_visible_rows() {
         let mut app = App::new("test".into());
-        app.push(make_event(1, "curl", Some("github.com"), 443, Verdict::Allow));
-        app.push(make_event(2, "firefox", Some("example.com"), 443, Verdict::Allow));
+        app.push(make_event(
+            1,
+            "curl",
+            Some("github.com"),
+            443,
+            Verdict::Allow,
+        ));
+        app.push(make_event(
+            2,
+            "firefox",
+            Some("example.com"),
+            443,
+            Verdict::Allow,
+        ));
         assert_eq!(app.filtered_indices().len(), 2);
         app.filter = "github".into();
         assert_eq!(app.filtered_indices().len(), 1);

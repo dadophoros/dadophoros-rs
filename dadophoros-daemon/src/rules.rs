@@ -125,10 +125,7 @@ pub fn load_dir(dir: &Path) -> Vec<Rule> {
                     continue;
                 }
                 if r.id.is_none() {
-                    r.id = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_owned);
+                    r.id = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned);
                 }
                 rules.push(r);
             }
@@ -148,7 +145,11 @@ pub fn evaluate(
     dport: u16,
 ) -> Option<Verdict> {
     for rule in rules {
-        if rule.matches.iter().all(|m| matches_one(m, exe, host, dport)) {
+        if rule
+            .matches
+            .iter()
+            .all(|m| matches_one(m, exe, host, dport))
+        {
             return Some(Verdict {
                 action: rule.action,
                 rule_id: rule.id.clone().unwrap_or_else(|| "?".to_string()),
@@ -219,7 +220,12 @@ mod tests {
 
     #[test]
     fn host_suffix_deny() {
-        let rules = vec![rule("block-dc", 100, Action::Deny, vec![host_suffix(".doubleclick.net")])];
+        let rules = vec![rule(
+            "block-dc",
+            100,
+            Action::Deny,
+            vec![host_suffix(".doubleclick.net")],
+        )];
         let v = evaluate(&rules, None, Some("ad.doubleclick.net"), 443).unwrap();
         assert_eq!(v.action, Action::Deny);
         assert_eq!(v.rule_id, "block-dc");
@@ -227,7 +233,12 @@ mod tests {
 
     #[test]
     fn host_suffix_no_match() {
-        let rules = vec![rule("block-dc", 100, Action::Deny, vec![host_suffix(".doubleclick.net")])];
+        let rules = vec![rule(
+            "block-dc",
+            100,
+            Action::Deny,
+            vec![host_suffix(".doubleclick.net")],
+        )];
         assert!(evaluate(&rules, None, Some("github.com"), 443).is_none());
     }
 
@@ -317,11 +328,7 @@ mod tests {
 
     #[test]
     fn port_op_variants() {
-        let exact = m(
-            MatchField::DestPort,
-            MatchOp::Exact,
-            MatchValue::Num(443),
-        );
+        let exact = m(MatchField::DestPort, MatchOp::Exact, MatchValue::Num(443));
         let in_list = m(
             MatchField::DestPort,
             MatchOp::In,
@@ -336,7 +343,11 @@ mod tests {
             "t",
             1,
             Action::Allow,
-            vec![m(MatchField::DestPort, MatchOp::Exact, MatchValue::Num(443))],
+            vec![m(
+                MatchField::DestPort,
+                MatchOp::Exact,
+                MatchValue::Num(443),
+            )],
         )];
         assert!(evaluate(&r, None, None, 80).is_none());
     }
@@ -344,7 +355,12 @@ mod tests {
     #[test]
     fn missing_host_or_exe_treated_as_empty_string() {
         // A suffix rule on .example.com against a None host should miss.
-        let r = vec![rule("h", 1, Action::Deny, vec![host_suffix(".example.com")])];
+        let r = vec![rule(
+            "h",
+            1,
+            Action::Deny,
+            vec![host_suffix(".example.com")],
+        )];
         assert!(evaluate(&r, None, None, 443).is_none());
     }
 
@@ -537,14 +553,26 @@ value = [80, 443]
         assert_eq!(rules[0].matches.len(), 3);
 
         // Matches: right exe, right host, allowed port.
-        let v = evaluate(&rules, Some("/usr/bin/apt"), Some("archive.ubuntu.com"), 443).unwrap();
+        let v = evaluate(
+            &rules,
+            Some("/usr/bin/apt"),
+            Some("archive.ubuntu.com"),
+            443,
+        )
+        .unwrap();
         assert_eq!(v.action, Action::Allow);
         assert_eq!(v.rule_id, "apt-https");
 
         // Misses: wrong port.
         assert!(evaluate(&rules, Some("/usr/bin/apt"), Some("archive.ubuntu.com"), 22).is_none());
         // Misses: wrong exe.
-        assert!(evaluate(&rules, Some("/usr/bin/curl"), Some("archive.ubuntu.com"), 443).is_none());
+        assert!(evaluate(
+            &rules,
+            Some("/usr/bin/curl"),
+            Some("archive.ubuntu.com"),
+            443
+        )
+        .is_none());
         // Misses: wrong host suffix.
         assert!(evaluate(&rules, Some("/usr/bin/apt"), Some("example.com"), 443).is_none());
     }

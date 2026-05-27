@@ -184,9 +184,14 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_multiple_messages_back_to_back() {
         let (mut w, mut r) = tokio::io::duplex(4096);
-        write_message(&mut w, &ServerMessage::Hello { daemon_version: "1.2.3".into() })
-            .await
-            .unwrap();
+        write_message(
+            &mut w,
+            &ServerMessage::Hello {
+                daemon_version: "1.2.3".into(),
+            },
+        )
+        .await
+        .unwrap();
         write_message(&mut w, &ServerMessage::Ok).await.unwrap();
         write_message(&mut w, &ServerMessage::Event(sample_event()))
             .await

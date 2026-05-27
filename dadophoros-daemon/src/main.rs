@@ -24,9 +24,8 @@ use rules::{Action, Verdict};
 
 const CGROUP_PATH: &str = "/sys/fs/cgroup";
 const RULES_DIR: &str = "/etc/dadophoros/rules.d";
-const EBPF_OBJ: &[u8] = include_bytes_aligned!(
-    "../../target/bpfel-unknown-none/release/dadophoros-ebpf"
-);
+const EBPF_OBJ: &[u8] =
+    include_bytes_aligned!("../../target/bpfel-unknown-none/release/dadophoros-ebpf");
 const CGROUP_HOOKS: &[&str] = &["connect4", "connect6", "sendmsg4", "sendmsg6"];
 const TRACEPOINTS: &[(&str, &str)] = &[
     ("syscalls", "sys_enter_execve"),
@@ -117,9 +116,7 @@ async fn main() -> Result<()> {
     let _rules_tx_keepalive = rules_tx.clone();
     let _watcher = make_rules_watcher(&rules_dir, rules_tx);
 
-    let events_map = ebpf
-        .take_map("EVENTS")
-        .context("EVENTS map missing")?;
+    let events_map = ebpf.take_map("EVENTS").context("EVENTS map missing")?;
     let dns_map = ebpf
         .take_map("DNS_EVENTS")
         .context("DNS_EVENTS map missing")?;
@@ -202,19 +199,18 @@ fn make_rules_watcher(
         warn!(dir = %dir.display(), "rules directory does not exist; not watching");
         return None;
     }
-    let mut watcher = match notify::recommended_watcher(
-        move |res: notify::Result<notify::Event>| {
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if res.is_ok() {
                 let _ = tx.send(());
             }
-        },
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            warn!(error = %e, "could not create rules watcher");
-            return None;
-        }
-    };
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "could not create rules watcher");
+                return None;
+            }
+        };
     if let Err(e) = watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
         warn!(dir = %dir.display(), error = %e, "could not watch rules dir");
         return None;
@@ -270,10 +266,7 @@ fn ingest_dns(event: &DnsEvent, cache: &mut HashMap<IpAddr, DnsEntry>) {
     }
 }
 
-fn lookup_host<'a>(
-    event: &ConnectEvent,
-    cache: &'a HashMap<IpAddr, DnsEntry>,
-) -> Option<&'a str> {
+fn lookup_host<'a>(event: &ConnectEvent, cache: &'a HashMap<IpAddr, DnsEntry>) -> Option<&'a str> {
     let ip = connect_event_ip(event)?;
     let entry = cache.get(&ip)?;
     if entry.expires_at > Instant::now() {
@@ -345,10 +338,7 @@ fn read_proc_exe(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
-fn lookup_exe(
-    pid: u32,
-    exe_paths: &mut HashMap<u32, Option<PathBuf>>,
-) -> Option<PathBuf> {
+fn lookup_exe(pid: u32, exe_paths: &mut HashMap<u32, Option<PathBuf>>) -> Option<PathBuf> {
     if let Some(cached) = exe_paths.get(&pid) {
         return cached.clone();
     }
@@ -357,12 +347,7 @@ fn lookup_exe(
     resolved
 }
 
-fn print_event(
-    e: &ConnectEvent,
-    exe: Option<&str>,
-    host: Option<&str>,
-    verdict: Option<&Verdict>,
-) {
+fn print_event(e: &ConnectEvent, exe: Option<&str>, host: Option<&str>, verdict: Option<&Verdict>) {
     let comm = comm_str(&e.comm);
     let addr = if e.family == 4 {
         Ipv4Addr::from(e.daddr_v4.to_ne_bytes()).to_string()

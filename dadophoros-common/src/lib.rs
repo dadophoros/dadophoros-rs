@@ -23,9 +23,9 @@ pub struct ProcessInfo {
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
-    pub _pad: u32,                 // align start_ns to 8 bytes
-    pub start_ns: u64,             // task->start_boottime, populated in later steps via CO-RE
-    pub exe_inode: u64,            // populated in step 8 (binary hashing)
+    pub _pad: u32,      // align start_ns to 8 bytes
+    pub start_ns: u64,  // task->start_boottime, populated in later steps via CO-RE
+    pub exe_inode: u64, // populated in step 8 (binary hashing)
     pub comm: [u8; 16],
 }
 

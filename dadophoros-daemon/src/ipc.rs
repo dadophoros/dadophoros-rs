@@ -16,8 +16,7 @@ pub fn spawn_server(events: broadcast::Sender<EnrichedEvent>) -> Result<()> {
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }
-    let listener = UnixListener::bind(path)
-        .with_context(|| format!("binding {SOCKET_PATH}"))?;
+    let listener = UnixListener::bind(path).with_context(|| format!("binding {SOCKET_PATH}"))?;
     // Permissive for local dev; the spec calls for tighter group permissions
     // in step 8 polish.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
@@ -41,10 +40,7 @@ pub fn spawn_server(events: broadcast::Sender<EnrichedEvent>) -> Result<()> {
     Ok(())
 }
 
-async fn handle_client(
-    stream: UnixStream,
-    events: broadcast::Sender<EnrichedEvent>,
-) -> Result<()> {
+async fn handle_client(stream: UnixStream, events: broadcast::Sender<EnrichedEvent>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
