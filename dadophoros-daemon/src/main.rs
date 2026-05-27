@@ -251,8 +251,8 @@ fn ingest_dns(event: &DnsEvent, cache: &mut HashMap<IpAddr, DnsEntry>) {
         let ttl = record.ttl().max(1);
         let expires_at = Instant::now() + Duration::from_secs(ttl as u64);
         let ip = match record.data() {
-            Some(RData::A(a)) => IpAddr::V4(Ipv4Addr::from(a.0)),
-            Some(RData::AAAA(aaaa)) => IpAddr::V6(Ipv6Addr::from(aaaa.0)),
+            Some(RData::A(a)) => IpAddr::V4(a.0),
+            Some(RData::AAAA(aaaa)) => IpAddr::V6(aaaa.0),
             _ => continue,
         };
         debug!(ip = %ip, host = %name, ttl = ttl, "DNS cache insert");

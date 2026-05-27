@@ -13,6 +13,9 @@ pub struct Rule {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub action: Action,
+    // Carried forward for step 6's once/session/persistent semantics; the
+    // current observe-mode code path never reads it.
+    #[allow(dead_code)]
     #[serde(default)]
     pub duration: Duration,
     #[serde(rename = "match", default)]
@@ -243,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn match_clauses_are_ANDed() {
+    fn match_clauses_are_anded() {
         let rules = vec![rule(
             "apt-https",
             100,

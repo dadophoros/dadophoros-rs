@@ -220,10 +220,8 @@ async fn run(
                 match msg {
                     Ok(ServerMessage::Event(ev)) => {
                         app.push(ev);
-                        if app.follow {
-                            if !app.events.is_empty() {
-                                app.state.select(Some(app.events.len() - 1));
-                            }
+                        if app.follow && !app.events.is_empty() {
+                            app.state.select(Some(app.events.len() - 1));
                         }
                     }
                     Ok(ServerMessage::Hello { .. }) | Ok(ServerMessage::Ok) => {}
