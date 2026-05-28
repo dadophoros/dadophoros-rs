@@ -67,6 +67,7 @@ pub struct Match {
 pub enum MatchField {
     ProcessPath,
     DestHost,
+    DestIp,
     DestPort,
 }
 
@@ -145,13 +146,14 @@ pub fn evaluate(
     rules: &[Rule],
     exe: Option<&str>,
     host: Option<&str>,
+    ip: Option<&str>,
     dport: u16,
 ) -> Option<Verdict> {
     for rule in rules {
         if rule
             .matches
             .iter()
-            .all(|m| matches_one(m, exe, host, dport))
+            .all(|m| matches_one(m, exe, host, ip, dport))
         {
             return Some(Verdict {
                 action: rule.action,
@@ -162,10 +164,17 @@ pub fn evaluate(
     None
 }
 
-fn matches_one(m: &Match, exe: Option<&str>, host: Option<&str>, dport: u16) -> bool {
+fn matches_one(
+    m: &Match,
+    exe: Option<&str>,
+    host: Option<&str>,
+    ip: Option<&str>,
+    dport: u16,
+) -> bool {
     match m.field {
         MatchField::ProcessPath => match_string(m.op, &m.value, exe.unwrap_or("")),
         MatchField::DestHost => match_string(m.op, &m.value, host.unwrap_or("")),
+        MatchField::DestIp => match_string(m.op, &m.value, ip.unwrap_or("")),
         MatchField::DestPort => match_port(m.op, &m.value, dport),
     }
 }
@@ -218,7 +227,7 @@ mod tests {
 
     #[test]
     fn no_rules_yields_no_verdict() {
-        assert!(evaluate(&[], Some("/usr/bin/curl"), Some("github.com"), 443).is_none());
+        assert!(evaluate(&[], Some("/usr/bin/curl"), Some("github.com"), None, 443).is_none());
     }
 
     #[test]
@@ -229,7 +238,7 @@ mod tests {
             Action::Deny,
             vec![host_suffix(".doubleclick.net")],
         )];
-        let v = evaluate(&rules, None, Some("ad.doubleclick.net"), 443).unwrap();
+        let v = evaluate(&rules, None, Some("ad.doubleclick.net"), None, 443).unwrap();
         assert_eq!(v.action, Action::Deny);
         assert_eq!(v.rule_id, "block-dc");
     }
@@ -242,7 +251,7 @@ mod tests {
             Action::Deny,
             vec![host_suffix(".doubleclick.net")],
         )];
-        assert!(evaluate(&rules, None, Some("github.com"), 443).is_none());
+        assert!(evaluate(&rules, None, Some("github.com"), None, 443).is_none());
     }
 
     #[test]
@@ -265,12 +274,12 @@ mod tests {
             ],
         )];
         // both clauses satisfied
-        assert!(evaluate(&rules, Some("/usr/bin/apt"), None, 80).is_some());
-        assert!(evaluate(&rules, Some("/usr/bin/apt"), None, 443).is_some());
+        assert!(evaluate(&rules, Some("/usr/bin/apt"), None, None, 80).is_some());
+        assert!(evaluate(&rules, Some("/usr/bin/apt"), None, None, 443).is_some());
         // process matches, port does not
-        assert!(evaluate(&rules, Some("/usr/bin/apt"), None, 22).is_none());
+        assert!(evaluate(&rules, Some("/usr/bin/apt"), None, None, 22).is_none());
         // port matches, process does not
-        assert!(evaluate(&rules, Some("/usr/bin/curl"), None, 80).is_none());
+        assert!(evaluate(&rules, Some("/usr/bin/curl"), None, None, 80).is_none());
     }
 
     #[test]
@@ -281,7 +290,7 @@ mod tests {
             rule("hi", 1, Action::Allow, vec![host_suffix(".example.com")]),
             rule("lo", 10, Action::Deny, vec![host_suffix(".example.com")]),
         ];
-        let v = evaluate(&rules, None, Some("a.example.com"), 443).unwrap();
+        let v = evaluate(&rules, None, Some("a.example.com"), None, 443).unwrap();
         assert_eq!(v.rule_id, "hi");
         assert_eq!(v.action, Action::Allow);
     }
@@ -289,7 +298,7 @@ mod tests {
     #[test]
     fn empty_matches_is_catch_all() {
         let rules = vec![rule("default-deny", 1000, Action::Deny, vec![])];
-        let v = evaluate(&rules, None, None, 443).unwrap();
+        let v = evaluate(&rules, None, None, None, 443).unwrap();
         assert_eq!(v.action, Action::Deny);
     }
 
@@ -323,7 +332,7 @@ mod tests {
         for one in [exact, prefix, suffix, contains, in_list] {
             let r = vec![rule("t", 1, Action::Allow, vec![one])];
             assert!(
-                evaluate(&r, Some("/usr/bin/curl"), None, 0).is_some(),
+                evaluate(&r, Some("/usr/bin/curl"), None, None, 0).is_some(),
                 "expected match"
             );
         }
@@ -339,7 +348,7 @@ mod tests {
         );
         for one in [exact, in_list] {
             let r = vec![rule("t", 1, Action::Allow, vec![one])];
-            assert!(evaluate(&r, None, None, 443).is_some());
+            assert!(evaluate(&r, None, None, None, 443).is_some());
         }
         // miss
         let r = vec![rule(
@@ -352,7 +361,7 @@ mod tests {
                 MatchValue::Num(443),
             )],
         )];
-        assert!(evaluate(&r, None, None, 80).is_none());
+        assert!(evaluate(&r, None, None, None, 80).is_none());
     }
 
     #[test]
@@ -364,7 +373,7 @@ mod tests {
             Action::Deny,
             vec![host_suffix(".example.com")],
         )];
-        assert!(evaluate(&r, None, None, 443).is_none());
+        assert!(evaluate(&r, None, None, None, 443).is_none());
     }
 
     // --- load_dir: filesystem-backed integration tests ---------------------
@@ -560,6 +569,7 @@ value = [80, 443]
             &rules,
             Some("/usr/bin/apt"),
             Some("archive.ubuntu.com"),
+            None,
             443,
         )
         .unwrap();
@@ -567,16 +577,17 @@ value = [80, 443]
         assert_eq!(v.rule_id, "apt-https");
 
         // Misses: wrong port.
-        assert!(evaluate(&rules, Some("/usr/bin/apt"), Some("archive.ubuntu.com"), 22).is_none());
+        assert!(evaluate(&rules, Some("/usr/bin/apt"), Some("archive.ubuntu.com"), None, 22).is_none());
         // Misses: wrong exe.
         assert!(evaluate(
             &rules,
             Some("/usr/bin/curl"),
             Some("archive.ubuntu.com"),
-            443
+            None,
+            443,
         )
         .is_none());
         // Misses: wrong host suffix.
-        assert!(evaluate(&rules, Some("/usr/bin/apt"), Some("example.com"), 443).is_none());
+        assert!(evaluate(&rules, Some("/usr/bin/apt"), Some("example.com"), None, 443).is_none());
     }
 }

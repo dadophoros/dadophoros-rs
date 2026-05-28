@@ -8,6 +8,31 @@ const MAX_FRAME: usize = 1 << 20; // 1 MiB
 pub enum ClientMessage {
     Subscribe { filter: Option<EventFilter> },
     Unsubscribe,
+    /// Ask the daemon to materialize a deny rule from a row the user picked
+    /// in the TUI. The daemon writes a TOML file under the rules directory
+    /// and the existing notify watcher reloads. Optional fields let the
+    /// daemon decline gracefully if the requested `by` kind requires data
+    /// the row didn't have (e.g. asking to deny by host when hostname is
+    /// None).
+    CreateDenyRule {
+        exe_path: Option<String>,
+        hostname: Option<String>,
+        dest_ip: Option<String>,
+        dport: u16,
+        by: DenyRuleKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DenyRuleKind {
+    /// dest_host suffix match on the given hostname.
+    Host,
+    /// process_path exact match on the given exe.
+    Process,
+    /// dest_ip exact match on the given address (v4 dotted-quad or v6 compact form).
+    Ip,
+    /// Host + process_path AND-ed together.
+    Both,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +53,20 @@ pub struct EventFilter {
 pub enum Verdict {
     Allow,
     Deny,
+}
+
+// FlowKey stays on the wire even though DecideVerdict went away — Step 8
+// brings it back when start_ns is populated and we want the TUI to be able
+// to reference flows directly.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FlowKey {
+    pub pid: u32,
+    pub start_ns: u64,
+    pub family: u8,
+    pub daddr_v4: u32,
+    pub daddr_v6: [u8; 16],
+    pub dport: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

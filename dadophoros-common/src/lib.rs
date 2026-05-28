@@ -6,6 +6,7 @@
 pub struct ConnectEvent {
     pub pid: u32,
     pub uid: u32,
+    pub start_ns: u64, // task->start_boottime, populated via CO-RE in step 8
     pub daddr_v4: u32,
     pub daddr_v6: [u8; 16],
     pub dport: u16,
@@ -14,7 +15,45 @@ pub struct ConnectEvent {
     pub comm: [u8; 16],
 }
 
-const _: () = assert!(core::mem::size_of::<ConnectEvent>() == 48);
+const _: () = assert!(core::mem::size_of::<ConnectEvent>() == 56);
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "user", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct FlowKey {
+    pub pid: u32,
+    pub _pad0: u32,         // align start_ns to 8 bytes
+    pub start_ns: u64,      // task->start_boottime, via CO-RE; defeats PID reuse
+    pub daddr_v4: u32,
+    pub daddr_v6: [u8; 16],
+    pub dport: u16,
+    pub family: u8,
+    pub _pad: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<FlowKey>() == 40);
+
+// Verdict values stored in VERDICT_CACHE. We only ever insert Deny under the
+// current "approve-by-default + explicit rule denies" model; Allow is kept
+// as a constant in case we revisit caching allow-rule matches for dedup.
+#[repr(u8)]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Deny = 0,
+    Allow = 1,
+}
+
+// aya requires its own Pod marker on map key/value types. Orphan rules
+// mean the impl has to live next to the type. All four below are repr(C),
+// Copy, and have no padding holes that aren't explicit _pad fields.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FlowKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ConnectEvent {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ProcessInfo {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for DnsEvent {}
 
 #[repr(C)]
 #[derive(Copy, Clone)]

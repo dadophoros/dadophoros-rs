@@ -8,10 +8,10 @@ use aya_ebpf::{
         gen::bpf_skb_load_bytes,
     },
     macros::{cgroup_sock_addr, classifier, map, tracepoint},
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, LruHashMap, RingBuf},
     programs::{SockAddrContext, TcContext, TracePointContext},
 };
-use dadophoros_common::{ConnectEvent, DnsEvent, ProcessInfo};
+use dadophoros_common::{ConnectEvent, DnsEvent, FlowKey, ProcessInfo};
 
 // Max bytes we copy from a DNS packet into the ringbuf entry.
 const DNS_BUF_MAX: u32 = 512;
@@ -25,30 +25,34 @@ static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static PROCESS_INFO: HashMap<u32, ProcessInfo> = HashMap::with_max_entries(32768, 0);
 
+// Per-flow deny cache. Userspace inserts an entry whenever a rule with
+// action="deny" matches a flow; the cgroup hook checks here and returns 0
+// to block subsequent connect()/sendmsg() calls without a userspace round
+// trip. We don't store Allow values — allow is the default for everything
+// that isn't in this map.
+#[map]
+static VERDICT_CACHE: LruHashMap<FlowKey, u8> = LruHashMap::with_max_entries(65_536, 0);
+
 // --- cgroup sock_addr hooks (Step 1) ----------------------------------------
 
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
-    emit_v4(ctx.sock_addr, false);
-    1
+    emit_v4(ctx.sock_addr, false)
 }
 
 #[cgroup_sock_addr(connect6)]
 pub fn connect6(ctx: SockAddrContext) -> i32 {
-    emit_v6(ctx.sock_addr, false);
-    1
+    emit_v6(ctx.sock_addr, false)
 }
 
 #[cgroup_sock_addr(sendmsg4)]
 pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
-    emit_v4(ctx.sock_addr, true);
-    1
+    emit_v4(ctx.sock_addr, true)
 }
 
 #[cgroup_sock_addr(sendmsg6)]
 pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
-    emit_v6(ctx.sock_addr, true);
-    1
+    emit_v6(ctx.sock_addr, true)
 }
 
 // read_volatile forces LLVM to emit a direct `*(u32 *)(ctx + const)` load
@@ -57,38 +61,48 @@ pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
 // ctx ptr disallowed".
 
 #[inline(always)]
-fn emit_v4(s: *mut bpf_sock_addr, is_sendmsg: bool) {
-    // Skip dport=0 events: connect()/sendmsg() with port 0 is socket
-    // bookkeeping (source-IP probes, AF_UNSPEC dissolution) and carries no
-    // real traffic.
+fn emit_v4(s: *mut bpf_sock_addr, is_sendmsg: bool) -> i32 {
     let port_u32 = unsafe { core::ptr::read_volatile(&(*s).user_port) };
     let dport = u16::from_be(port_u32 as u16);
     if dport == 0 {
-        return;
+        return 1;
     }
 
     let daddr_v4 = unsafe { core::ptr::read_volatile(&(*s).user_ip4) };
 
-    // For UDP sendmsg only: drop deliveries to 127.0.0.0/8. These are
-    // intra-host plumbing (e.g. systemd-resolved sending DNS replies back
-    // to the requesting app's ephemeral port). The original outbound
-    // query side goes through connect() and stays visible.
-    // daddr_v4 holds the raw __be32 value; on the LE BPF target the
-    // first network byte sits in the low byte of the u32.
     if is_sendmsg && (daddr_v4 & 0xFF) == 0x7F {
-        return;
+        return 1;
+    }
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+
+    // Deny cache lookup. Any entry here means a rule has told us to block
+    // this flow — return 0, no event emitted (kernel-side dedup).
+    let key = FlowKey {
+        pid,
+        _pad0: 0,
+        start_ns: 0, // step 8: read from task->start_boottime via CO-RE
+        daddr_v4,
+        daddr_v6: [0u8; 16],
+        dport,
+        family: 4,
+        _pad: 0,
+    };
+    if unsafe { VERDICT_CACHE.get(&key) }.is_some() {
+        return 0;
     }
 
     let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) else {
-        return;
+        return 1;
     };
-    let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
     let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
 
     let ev = ConnectEvent {
-        pid: (pid_tgid >> 32) as u32,
+        pid,
         uid: uid_gid as u32,
+        start_ns: 0,
         daddr_v4,
         daddr_v6: [0u8; 16],
         dport,
@@ -101,14 +115,15 @@ fn emit_v4(s: *mut bpf_sock_addr, is_sendmsg: bool) {
         core::ptr::write_unaligned(entry.as_mut_ptr(), ev);
     }
     entry.submit(0);
+    1
 }
 
 #[inline(always)]
-fn emit_v6(s: *mut bpf_sock_addr, is_sendmsg: bool) {
+fn emit_v6(s: *mut bpf_sock_addr, is_sendmsg: bool) -> i32 {
     let port_u32 = unsafe { core::ptr::read_volatile(&(*s).user_port) };
     let dport = u16::from_be(port_u32 as u16);
     if dport == 0 {
-        return;
+        return 1;
     }
 
     let w0 = unsafe { core::ptr::read_volatile(&(*s).user_ip6[0]) };
@@ -116,25 +131,38 @@ fn emit_v6(s: *mut bpf_sock_addr, is_sendmsg: bool) {
     let w2 = unsafe { core::ptr::read_volatile(&(*s).user_ip6[2]) };
     let w3 = unsafe { core::ptr::read_volatile(&(*s).user_ip6[3]) };
 
-    // For UDP sendmsg only: drop ::1 (bytes: 15× 0x00 then 0x01). On the LE
-    // BPF target that final byte lives in the low byte of word 3 read as a
-    // host-order u32 — i.e. word 3 reads as 0x0100_0000.
     if is_sendmsg && w0 == 0 && w1 == 0 && w2 == 0 && w3 == 0x0100_0000 {
-        return;
+        return 1;
+    }
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let daddr_v6: [u8; 16] = unsafe { core::mem::transmute([w0, w1, w2, w3]) };
+
+    let key = FlowKey {
+        pid,
+        _pad0: 0,
+        start_ns: 0,
+        daddr_v4: 0,
+        daddr_v6,
+        dport,
+        family: 6,
+        _pad: 0,
+    };
+    if unsafe { VERDICT_CACHE.get(&key) }.is_some() {
+        return 0;
     }
 
     let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) else {
-        return;
+        return 1;
     };
-    let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
     let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
 
-    let daddr_v6: [u8; 16] = unsafe { core::mem::transmute([w0, w1, w2, w3]) };
-
     let ev = ConnectEvent {
-        pid: (pid_tgid >> 32) as u32,
+        pid,
         uid: uid_gid as u32,
+        start_ns: 0,
         daddr_v4: 0,
         daddr_v6,
         dport,
@@ -147,6 +175,7 @@ fn emit_v6(s: *mut bpf_sock_addr, is_sendmsg: bool) {
         core::ptr::write_unaligned(entry.as_mut_ptr(), ev);
     }
     entry.submit(0);
+    1
 }
 
 // --- tracepoints maintaining PROCESS_INFO (Step 2) --------------------------

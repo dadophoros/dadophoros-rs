@@ -6,16 +6,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::RingBuf,
+    maps::{HashMap as AyaHashMap, RingBuf},
     programs::{tc, CgroupAttachMode, CgroupSockAddr, SchedClassifier, TcAttachType, TracePoint},
     Ebpf,
 };
-use dadophoros_common::{ConnectEvent, DnsEvent};
-use dadophoros_proto::EnrichedEvent;
+use dadophoros_common::{ConnectEvent, DnsEvent, FlowKey};
+use dadophoros_proto::{EnrichedEvent, ServerMessage};
 use hickory_proto::{op::Message, rr::RData, serialize::binary::BinDecodable};
 use notify::Watcher;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 mod ipc;
@@ -23,7 +23,7 @@ mod rules;
 use rules::{Action, Verdict};
 
 const CGROUP_PATH: &str = "/sys/fs/cgroup";
-const RULES_DIR: &str = "/etc/dadophoros/rules.d";
+pub(crate) const RULES_DIR: &str = "/etc/dadophoros/rules.d";
 const EBPF_OBJ: &[u8] =
     include_bytes_aligned!("../../target/bpfel-unknown-none/release/dadophoros-ebpf");
 const CGROUP_HOOKS: &[&str] = &["connect4", "connect6", "sendmsg4", "sendmsg6"];
@@ -37,6 +37,8 @@ const DNS_TC_HOOKS: &[(&str, TcAttachType)] = &[
     ("dns_ingress", TcAttachType::Ingress),
 ];
 
+const VERDICT_DENY: u8 = 0;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -46,6 +48,8 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    info!("starting");
 
     let mut ebpf = Ebpf::load(EBPF_OBJ).context("loading eBPF object")?;
     let cgroup = std::fs::File::open(CGROUP_PATH)
@@ -99,20 +103,22 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Take the verdict cache handle. Main loop writes to it directly on rule
+    // matches; the kernel reads it on every connect/sendmsg.
+    let cache_map = ebpf
+        .take_map("VERDICT_CACHE")
+        .context("VERDICT_CACHE map missing")?;
+    let mut verdict_cache: AyaHashMap<_, FlowKey, u8> = AyaHashMap::try_from(cache_map)?;
+
     let mut exe_paths: HashMap<u32, Option<PathBuf>> = HashMap::new();
     backfill_proc(&mut exe_paths);
     info!(pids = exe_paths.len(), "/proc backfill complete");
 
-    // Load rules + start a filesystem watcher. The watcher's closure runs on
-    // notify's own thread; we bridge into tokio via an unbounded mpsc.
     let rules_dir = PathBuf::from(RULES_DIR);
     let mut rule_set = rules::load_dir(&rules_dir);
     info!(count = rule_set.len(), dir = %rules_dir.display(), "loaded rules");
 
-    let (rules_tx, mut rules_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    // Hold an extra Sender so the channel stays open even when the watcher
-    // can't be created (e.g. no rules dir). Otherwise rules_rx.recv() would
-    // return None immediately, triggering the select arm in a hot loop.
+    let (rules_tx, mut rules_rx) = mpsc::unbounded_channel::<()>();
     let _rules_tx_keepalive = rules_tx.clone();
     let _watcher = make_rules_watcher(&rules_dir, rules_tx);
 
@@ -128,10 +134,10 @@ async fn main() -> Result<()> {
     let mut dns_cache: HashMap<IpAddr, DnsEntry> = HashMap::new();
     let mut evict_tick = tokio::time::interval(Duration::from_secs(1));
 
-    // Broadcast channel for IPC subscribers. Capacity is bounded; slow
-    // clients see Lagged() and drop the missed events.
-    let (event_tx, _) = broadcast::channel::<EnrichedEvent>(1024);
-    ipc::spawn_server(event_tx.clone())?;
+    // Broadcast ServerMessages (only Event under the current model — other
+    // variants are per-connection responses, never broadcast).
+    let (event_tx, _) = broadcast::channel::<ServerMessage>(1024);
+    ipc::spawn_server(event_tx.clone(), rules_dir.clone())?;
 
     info!("draining events (Ctrl-C to exit)");
 
@@ -164,17 +170,36 @@ async fn main() -> Result<()> {
                     let exe = lookup_exe(event.pid, &mut exe_paths);
                     let exe_str = exe.as_deref().and_then(|p| p.to_str());
                     let host = lookup_host(&event, &dns_cache);
-                    let verdict = rules::evaluate(&rule_set, exe_str, host, event.dport);
+                    let dest_ip_string = event_ip_string(&event);
+                    let verdict = rules::evaluate(
+                        &rule_set,
+                        exe_str,
+                        host,
+                        dest_ip_string.as_deref(),
+                        event.dport,
+                    );
                     print_event(&event, exe_str, host, verdict.as_ref());
+
+                    // Cache deny verdicts in the kernel so the next connect
+                    // from the same flow is blocked without round-tripping
+                    // back to userspace. Allow rules don't write here —
+                    // allow is the implicit default for anything not in
+                    // the map.
+                    if let Some(v) = &verdict {
+                        if v.action == Action::Deny {
+                            let key = common_flow_key(&event);
+                            if let Err(e) = verdict_cache.insert(key, VERDICT_DENY, 0) {
+                                warn!(error = %e, "deny cache insert failed");
+                            }
+                        }
+                    }
+
                     let enriched = enrich(&event, exe_str, host, verdict.as_ref());
-                    // Err here means no subscribers; not actionable.
-                    let _ = event_tx.send(enriched);
+                    let _ = event_tx.send(ServerMessage::Event(enriched));
                 }
                 guard.clear_ready();
             }
             _ = rules_rx.recv() => {
-                // Drain coalesced notifications so we don't reload N times for
-                // a single editor save.
                 while rules_rx.try_recv().is_ok() {}
                 rule_set = rules::load_dir(&rules_dir);
                 info!(count = rule_set.len(), "reloaded rules");
@@ -193,7 +218,7 @@ async fn main() -> Result<()> {
 
 fn make_rules_watcher(
     dir: &Path,
-    tx: tokio::sync::mpsc::UnboundedSender<()>,
+    tx: mpsc::UnboundedSender<()>,
 ) -> Option<notify::RecommendedWatcher> {
     if !dir.exists() {
         warn!(dir = %dir.display(), "rules directory does not exist; not watching");
@@ -271,6 +296,22 @@ fn lookup_host<'a>(event: &ConnectEvent, cache: &'a HashMap<IpAddr, DnsEntry>) -
     let entry = cache.get(&ip)?;
     if entry.expires_at > Instant::now() {
         Some(&entry.hostname)
+    } else {
+        None
+    }
+}
+
+/// Display form of the connection's destination address, in the same format
+/// the TUI uses when sending dest_ip in `CreateDenyRule`. Returns None for
+/// zero v4 or unknown family.
+fn event_ip_string(e: &ConnectEvent) -> Option<String> {
+    if e.family == 4 {
+        if e.daddr_v4 == 0 {
+            return None;
+        }
+        Some(Ipv4Addr::from(e.daddr_v4.to_ne_bytes()).to_string())
+    } else if e.family == 6 {
+        Some(Ipv6Addr::from(e.daddr_v6).to_string())
     } else {
         None
     }
@@ -377,74 +418,23 @@ fn comm_str(buf: &[u8; 16]) -> &str {
     std::str::from_utf8(&buf[..end]).unwrap_or("?")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::IpAddr;
-
-    #[test]
-    fn comm_str_stops_at_null() {
-        let buf = *b"curl\0extra-bytes";
-        assert_eq!(comm_str(&buf), "curl");
-    }
-
-    #[test]
-    fn comm_str_empty_buffer() {
-        let buf = [0u8; 16];
-        assert_eq!(comm_str(&buf), "");
-    }
-
-    #[test]
-    fn comm_str_full_buffer_no_null() {
-        let buf = *b"abcdefghijklmnop";
-        assert_eq!(comm_str(&buf), "abcdefghijklmnop");
-    }
-
-    fn ev(family: u8, daddr_v4: u32, daddr_v6: [u8; 16]) -> ConnectEvent {
-        ConnectEvent {
-            pid: 0,
-            uid: 0,
-            daddr_v4,
-            daddr_v6,
-            dport: 443,
-            family,
-            _pad: 0,
-            comm: [0; 16],
-        }
-    }
-
-    #[test]
-    fn connect_event_ip_v4_decodes_network_order() {
-        // user_ip4 holds the raw __be32: bytes in memory are network order.
-        // For 1.2.3.4 those bytes are [0x01, 0x02, 0x03, 0x04]. On a LE host
-        // the u32 value is 0x04030201.
-        let e = ev(4, 0x04030201, [0; 16]);
-        let ip = connect_event_ip(&e).unwrap();
-        assert_eq!(ip, IpAddr::V4("1.2.3.4".parse().unwrap()));
-    }
-
-    #[test]
-    fn connect_event_ip_v6_returns_addr_from_bytes() {
-        let bytes: [u8; 16] = [
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-        ];
-        let e = ev(6, 0, bytes);
-        let ip = connect_event_ip(&e).unwrap();
-        assert_eq!(ip, IpAddr::V6("2001:db8::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn connect_event_ip_zero_v4_is_none() {
-        let e = ev(4, 0, [0; 16]);
-        assert!(connect_event_ip(&e).is_none());
-    }
-
-    #[test]
-    fn connect_event_ip_unknown_family_is_none() {
-        let e = ev(255, 0, [0; 16]);
-        assert!(connect_event_ip(&e).is_none());
+fn common_flow_key(e: &ConnectEvent) -> FlowKey {
+    FlowKey {
+        pid: e.pid,
+        _pad0: 0,
+        start_ns: e.start_ns,
+        daddr_v4: e.daddr_v4,
+        daddr_v6: e.daddr_v6,
+        dport: e.dport,
+        family: e.family,
+        _pad: 0,
     }
 }
+
+// proto<->common FlowKey conversion functions removed: the DecideVerdict
+// path that needed them went away with the enforcement pivot. When the
+// Step 8 CO-RE work lands a real start_ns and we want to reference flows
+// from the TUI again, bring them back.
 
 fn enrich(
     e: &ConnectEvent,
@@ -480,4 +470,72 @@ fn enrich(
         verdict: vd,
         matched_rule: rule,
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn comm_str_stops_at_null() {
+        let buf = *b"curl\0extra-bytes";
+        assert_eq!(comm_str(&buf), "curl");
+    }
+
+    #[test]
+    fn comm_str_empty_buffer() {
+        let buf = [0u8; 16];
+        assert_eq!(comm_str(&buf), "");
+    }
+
+    #[test]
+    fn comm_str_full_buffer_no_null() {
+        let buf = *b"abcdefghijklmnop";
+        assert_eq!(comm_str(&buf), "abcdefghijklmnop");
+    }
+
+    fn ev(family: u8, daddr_v4: u32, daddr_v6: [u8; 16]) -> ConnectEvent {
+        ConnectEvent {
+            pid: 0,
+            uid: 0,
+            start_ns: 0,
+            daddr_v4,
+            daddr_v6,
+            dport: 443,
+            family,
+            _pad: 0,
+            comm: [0; 16],
+        }
+    }
+
+    #[test]
+    fn connect_event_ip_v4_decodes_network_order() {
+        let e = ev(4, 0x04030201, [0; 16]);
+        let ip = connect_event_ip(&e).unwrap();
+        assert_eq!(ip, IpAddr::V4("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn connect_event_ip_v6_returns_addr_from_bytes() {
+        let bytes: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        let e = ev(6, 0, bytes);
+        let ip = connect_event_ip(&e).unwrap();
+        assert_eq!(ip, IpAddr::V6("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn connect_event_ip_zero_v4_is_none() {
+        let e = ev(4, 0, [0; 16]);
+        assert!(connect_event_ip(&e).is_none());
+    }
+
+    #[test]
+    fn connect_event_ip_unknown_family_is_none() {
+        let e = ev(255, 0, [0; 16]);
+        assert!(connect_event_ip(&e).is_none());
+    }
+
 }
