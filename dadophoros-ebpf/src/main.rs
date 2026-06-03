@@ -35,6 +35,7 @@ static VERDICT_CACHE: LruHashMap<FlowKey, u8> = LruHashMap::with_max_entries(65_
 
 // --- cgroup sock_addr hooks (Step 1) ----------------------------------------
 
+// IPv4 connect()
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
     emit_v4(ctx.sock_addr, false)
@@ -70,6 +71,8 @@ fn emit_v4(s: *mut bpf_sock_addr, is_sendmsg: bool) -> i32 {
 
     let daddr_v4 = unsafe { core::ptr::read_volatile(&(*s).user_ip4) };
 
+    // drop UDP packets aimed at loopback" filter
+    // daddr_v4 & 0xFF extracts the low byte of the u32, which is the first octet of the IP in network order — 0x7F means 127
     if is_sendmsg && (daddr_v4 & 0xFF) == 0x7F {
         return 1;
     }
@@ -93,6 +96,8 @@ fn emit_v4(s: *mut bpf_sock_addr, is_sendmsg: bool) -> i32 {
         return 0;
     }
 
+    // reserving 56 bytes of space in the kernel ringbuf so we can write a ConnectEvent directly into shared memory
+    // entry is RingBufEntry<ConnectEvent>
     let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) else {
         return 1;
     };
@@ -185,6 +190,8 @@ fn emit_v6(s: *mut bpf_sock_addr, is_sendmsg: bool) -> i32 {
 // comm reflects the *old* exe at this point — the new comm becomes visible
 // after the kernel finishes loading. For Step 2 we leave start_ns/ppid/
 // exe_inode as 0; later steps fill them in via CO-RE.
+// execve is the Linux syscall that replaces the program currently running in a process with a different one, keeping the same PID. The full name is "execute, vector, environment": it takes a path to an executable, a vector of arguments, and an environment array.
+// a BPF program of kernel type BPF_PROG_TYPE_TRACEPOINT
 #[tracepoint]
 pub fn sys_enter_execve(_ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
