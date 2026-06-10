@@ -6,7 +6,9 @@ const MAX_FRAME: usize = 1 << 20; // 1 MiB
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
-    Subscribe { filter: Option<EventFilter> },
+    Subscribe {
+        filter: Option<EventFilter>,
+    },
     Unsubscribe,
     /// Ask the daemon to materialize a deny rule from a row the user picked
     /// in the TUI. The daemon writes a TOML file under the rules directory
@@ -21,6 +23,20 @@ pub enum ClientMessage {
         dport: u16,
         by: DenyRuleKind,
     },
+    /// Ask the daemon for the full rule set, disabled rules included, so the
+    /// TUI's Rules view can browse them. The reply is `ServerMessage::Rules`.
+    ListRules,
+    /// Flip a rule's `enabled` flag on disk. The daemon rewrites the TOML
+    /// file (preserving the rest of it) and its notify watcher reloads the
+    /// active rule set. `id` is the rule's effective id (explicit `id` field
+    /// or, failing that, the file stem) as reported by `ListRules`.
+    SetRuleEnabled {
+        id: String,
+        enabled: bool,
+    },
+    /// Ask the daemon for the current aggregate stats snapshot. The reply is
+    /// `ServerMessage::Stats`.
+    GetStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,10 +53,65 @@ pub enum DenyRuleKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
-    Hello { daemon_version: String },
+    Hello {
+        daemon_version: String,
+    },
     Event(EnrichedEvent),
     Ok,
     Error(String),
+    /// Full rule set in priority order, disabled rules included. Reply to
+    /// `ClientMessage::ListRules`.
+    Rules(Vec<RuleInfo>),
+    /// Aggregate snapshot. Reply to `ClientMessage::GetStats`.
+    Stats(Stats),
+}
+
+/// A rule as the TUI needs to display and act on it. This is a flattened,
+/// display-oriented view of the daemon's internal `Rule`; the daemon owns the
+/// authoritative parsing and never round-trips through this type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleInfo {
+    /// Effective id: the explicit `id` field, or the file stem if absent.
+    pub id: String,
+    pub priority: u32,
+    pub enabled: bool,
+    pub action: RuleAction,
+    /// `once` | `session` | `persistent`, as written in the file.
+    pub duration: String,
+    /// One human-readable summary per `[[match]]` clause, e.g.
+    /// `dest_host suffix .doubleclick.net`. Empty means catch-all.
+    pub matches: Vec<String>,
+    /// Absolute path to the backing TOML file, so the TUI can open it in
+    /// `$EDITOR`.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuleAction {
+    Allow,
+    Deny,
+}
+
+/// Aggregate counters maintained by the daemon over the session. Cheap to
+/// clone; sent whole in reply to `GetStats`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Stats {
+    pub total_events: u64,
+    pub total_allowed: u64,
+    pub total_denied: u64,
+    /// Top processes by connection count, descending.
+    pub top_processes: Vec<LabeledCount>,
+    /// Top destination hosts (or bare IPs) by connection count, descending.
+    pub top_hosts: Vec<LabeledCount>,
+    /// Per-second connection counts, oldest first, for a sparkline. The
+    /// last bucket is the current (still-filling) second.
+    pub activity: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabeledCount {
+    pub label: String,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,6 +314,94 @@ mod tests {
         assert!(matches!(m2, ServerMessage::Ok));
         let m3: ServerMessage = read_message(&mut r).await.unwrap();
         assert!(matches!(m3, ServerMessage::Event(_)));
+    }
+
+    #[tokio::test]
+    async fn roundtrip_list_rules_and_reply() {
+        let (mut w, mut r) = tokio::io::duplex(2048);
+        write_message(&mut w, &ClientMessage::ListRules)
+            .await
+            .unwrap();
+        let got: ClientMessage = read_message(&mut r).await.unwrap();
+        assert!(matches!(got, ClientMessage::ListRules));
+
+        let infos = vec![RuleInfo {
+            id: "block-dc".into(),
+            priority: 100,
+            enabled: false,
+            action: RuleAction::Deny,
+            duration: "persistent".into(),
+            matches: vec!["dest_host suffix .doubleclick.net".into()],
+            path: "/etc/dadophoros/rules.d/block-dc.toml".into(),
+        }];
+        write_message(&mut w, &ServerMessage::Rules(infos.clone()))
+            .await
+            .unwrap();
+        let got: ServerMessage = read_message(&mut r).await.unwrap();
+        let ServerMessage::Rules(rs) = got else {
+            panic!("expected Rules");
+        };
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].id, "block-dc");
+        assert!(!rs[0].enabled);
+        assert_eq!(rs[0].action, RuleAction::Deny);
+        assert_eq!(rs[0].matches, infos[0].matches);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_set_rule_enabled() {
+        let (mut w, mut r) = tokio::io::duplex(1024);
+        write_message(
+            &mut w,
+            &ClientMessage::SetRuleEnabled {
+                id: "block-dc".into(),
+                enabled: false,
+            },
+        )
+        .await
+        .unwrap();
+        let got: ClientMessage = read_message(&mut r).await.unwrap();
+        let ClientMessage::SetRuleEnabled { id, enabled } = got else {
+            panic!("expected SetRuleEnabled");
+        };
+        assert_eq!(id, "block-dc");
+        assert!(!enabled);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_get_stats_and_reply() {
+        let (mut w, mut r) = tokio::io::duplex(2048);
+        write_message(&mut w, &ClientMessage::GetStats)
+            .await
+            .unwrap();
+        let got: ClientMessage = read_message(&mut r).await.unwrap();
+        assert!(matches!(got, ClientMessage::GetStats));
+
+        let stats = Stats {
+            total_events: 10,
+            total_allowed: 7,
+            total_denied: 3,
+            top_processes: vec![LabeledCount {
+                label: "/usr/bin/curl".into(),
+                count: 4,
+            }],
+            top_hosts: vec![LabeledCount {
+                label: "github.com".into(),
+                count: 5,
+            }],
+            activity: vec![0, 1, 2, 3],
+        };
+        write_message(&mut w, &ServerMessage::Stats(stats.clone()))
+            .await
+            .unwrap();
+        let got: ServerMessage = read_message(&mut r).await.unwrap();
+        let ServerMessage::Stats(s) = got else {
+            panic!("expected Stats");
+        };
+        assert_eq!(s.total_events, 10);
+        assert_eq!(s.total_denied, 3);
+        assert_eq!(s.top_processes[0].label, "/usr/bin/curl");
+        assert_eq!(s.activity, vec![0, 1, 2, 3]);
     }
 
     #[tokio::test]

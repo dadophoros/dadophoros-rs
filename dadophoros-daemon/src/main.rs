@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 
 mod ipc;
 mod rules;
+mod stats;
 use rules::{Action, Verdict};
 
 const CGROUP_PATH: &str = "/sys/fs/cgroup";
@@ -137,7 +138,13 @@ async fn main() -> Result<()> {
     // Broadcast ServerMessages (only Event under the current model — other
     // variants are per-connection responses, never broadcast).
     let (event_tx, _) = broadcast::channel::<ServerMessage>(1024);
-    ipc::spawn_server(event_tx.clone(), rules_dir.clone())?;
+
+    // Aggregate stats: the main loop is the sole writer; clients read the
+    // latest snapshot off a watch channel without touching the hot path.
+    let mut stats_acc = stats::Accumulator::new();
+    let (stats_tx, stats_rx) = tokio::sync::watch::channel(stats_acc.snapshot());
+
+    ipc::spawn_server(event_tx.clone(), rules_dir.clone(), stats_rx)?;
 
     info!("draining events (Ctrl-C to exit)");
 
@@ -195,6 +202,7 @@ async fn main() -> Result<()> {
                     }
 
                     let enriched = enrich(&event, exe_str, host, verdict.as_ref());
+                    stats_acc.record(&enriched);
                     let _ = event_tx.send(ServerMessage::Event(enriched));
                 }
                 guard.clear_ready();
@@ -211,6 +219,10 @@ async fn main() -> Result<()> {
                 if dns_cache.len() != before {
                     debug!(removed = before - dns_cache.len(), "DNS cache eviction");
                 }
+                // Rotate the activity ring and publish a fresh snapshot so
+                // Stats-view clients see ~1 Hz updates.
+                stats_acc.tick();
+                let _ = stats_tx.send(stats_acc.snapshot());
             }
         }
     }
@@ -537,5 +549,4 @@ mod tests {
         let e = ev(255, 0, [0; 16]);
         assert!(connect_event_ip(&e).is_none());
     }
-
 }

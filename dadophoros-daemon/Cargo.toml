@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hickory-proto = { version = "0.24", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml_edit = "0.22"
 notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
 dadophoros-common = { path = "../dadophoros-common", features = ["user"] }
 dadophoros-proto = { path = "../dadophoros-proto" }

@@ -248,8 +248,22 @@ sudo target/release/dadophorosd       # one terminal
 target/release/dadophoros             # another terminal, no sudo
 ```
 
-In the TUI: `↑↓` scroll, `PgUp/PgDn` page, `Home`/`End` jump, `/` filter,
-`d` deny-rule modal, `q` quit.
+The TUI has three tabbed views, switched with `Tab` or the number keys
+`1`/`2`/`3`:
+
+- **1 Live** — the event stream. `↑↓` scroll, `PgUp/PgDn` page, `Home`/`End`
+  jump, `/` filter, `d` deny-rule modal.
+- **2 Rules** — every rule in priority order, disabled ones included. `↑↓`
+  select, `t` (or space) toggle a rule on/off, `e` open its file in
+  `$EDITOR`, `r` refresh. Toggles and edits go through the daemon's file
+  watcher, so the active rule set reloads automatically. (Editing a rule
+  under `/etc/dadophoros/rules.d/` needs write access to that file — run
+  the TUI with the necessary privileges, or `sudo -e` the file directly.)
+- **3 Stats** — session totals (events / allowed / denied), a
+  connections-per-second sparkline, and the top processes and hosts by
+  connection count. Refreshes about once a second; `r` forces a refresh.
+
+`q` quits from any view.
 
 Rules live as TOML files under `/etc/dadophoros/rules.d/`. Manual example:
 
@@ -281,6 +295,10 @@ What works today:
 - Per-flow kernel-side deny enforcement via `VERDICT_CACHE`
 - TUI with live view, aggregation, filtering, and a modal that turns
   observations into rule files in place
+- TUI rules view: browse all rules, toggle them on/off, and open them in
+  `$EDITOR` — with the daemon hot-reloading on save
+- TUI stats view: session totals, a connections/s sparkline, and top
+  processes and hosts by connection count
 
 Known limitations (Step 8 polish territory, see [SPEC.md](SPEC.md)):
 
@@ -291,8 +309,10 @@ Known limitations (Step 8 polish territory, see [SPEC.md](SPEC.md)):
   the destination IPs.
 - **`FlowKey.start_ns` is currently zero.** PID reuse can briefly alias
   cached verdicts. The CO-RE fix described in SPEC #3 is planned.
-- **No rules-management view in the TUI yet.** Browse / disable / edit
-  rules by editing TOML files directly.
+- **No session-rule persistence yet.** The Rules view manages persistent
+  TOML rules; the `once`/`session` durations from the rule schema aren't
+  wired to a lifecycle, and the daemon has no opt-in "save session rules on
+  shutdown" flow. Deferred from Step 7 pending a design for those semantics.
 - **TCP/53 DNS is not captured.** UDP/53 only for now.
 
 ## Tests
@@ -301,10 +321,12 @@ Known limitations (Step 8 polish territory, see [SPEC.md](SPEC.md)):
 cargo test
 ```
 
-53 unit and integration tests cover: rule parsing and evaluation, IPC
-frame round-trips, TOML rule-file writing, TUI aggregation, and the
-TUI's optimistic-deny logic. The eBPF crate is exercised by the kernel
-verifier at load time rather than by unit tests.
+73 unit and integration tests cover: rule parsing, evaluation, listing,
+and the enable/disable rewrite; IPC frame round-trips (events, rules,
+stats); TOML rule-file writing; stats aggregation; TUI aggregation,
+rules-view navigation/toggle, and the optimistic-deny logic. The eBPF
+crate is exercised by the kernel verifier at load time rather than by
+unit tests.
 
 ## License
 

@@ -22,8 +22,8 @@ const _: () = assert!(core::mem::size_of::<ConnectEvent>() == 56);
 #[cfg_attr(feature = "user", derive(bytemuck::Pod, bytemuck::Zeroable))]
 pub struct FlowKey {
     pub pid: u32,
-    pub _pad0: u32,         // align start_ns to 8 bytes
-    pub start_ns: u64,      // task->start_boottime, via CO-RE; defeats PID reuse
+    pub _pad0: u32,    // align start_ns to 8 bytes
+    pub start_ns: u64, // task->start_boottime, via CO-RE; defeats PID reuse
     pub daddr_v4: u32,
     pub daddr_v6: [u8; 16],
     pub dport: u16,

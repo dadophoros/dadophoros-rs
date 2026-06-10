@@ -3,23 +3,26 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use dadophoros_proto::{
-    read_message, write_message, ClientMessage, DenyRuleKind, ServerMessage, SOCKET_PATH,
+    read_message, write_message, ClientMessage, DenyRuleKind, RuleAction, RuleInfo, ServerMessage,
+    Stats, SOCKET_PATH,
 };
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
+
+use crate::rules;
 
 pub fn spawn_server(
     events: broadcast::Sender<ServerMessage>,
     rules_dir: PathBuf,
+    stats: watch::Receiver<Stats>,
 ) -> Result<()> {
     let path = Path::new(SOCKET_PATH);
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }
-    let listener =
-        UnixListener::bind(path).with_context(|| format!("binding {SOCKET_PATH}"))?;
+    let listener = UnixListener::bind(path).with_context(|| format!("binding {SOCKET_PATH}"))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
     info!(path = SOCKET_PATH, "IPC listening");
 
@@ -29,8 +32,9 @@ pub fn spawn_server(
                 Ok((stream, _)) => {
                     let tx = events.clone();
                     let dir = rules_dir.clone();
+                    let stats = stats.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, tx, dir).await {
+                        if let Err(e) = handle_client(stream, tx, dir, stats).await {
                             debug!(error = %e, "client disconnected");
                         }
                     });
@@ -46,6 +50,7 @@ async fn handle_client(
     stream: UnixStream,
     events: broadcast::Sender<ServerMessage>,
     rules_dir: PathBuf,
+    stats: watch::Receiver<Stats>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -95,6 +100,33 @@ async fn handle_client(
                             break;
                         }
                     }
+                    Ok(ClientMessage::ListRules) => {
+                        let infos = list_rule_infos(&rules_dir);
+                        if write_message(&mut writer, &ServerMessage::Rules(infos)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientMessage::SetRuleEnabled { id, enabled }) => {
+                        let ack = match rules::set_enabled(&rules_dir, &id, enabled) {
+                            Ok(path) => {
+                                info!(path = %path.display(), id = %id, enabled, "toggled rule");
+                                ServerMessage::Ok
+                            }
+                            Err(e) => {
+                                warn!(error = %e, id = %id, "rule toggle failed");
+                                ServerMessage::Error(e.to_string())
+                            }
+                        };
+                        if write_message(&mut writer, &ack).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientMessage::GetStats) => {
+                        let snap = stats.borrow().clone();
+                        if write_message(&mut writer, &ServerMessage::Stats(snap)).await.is_err() {
+                            break;
+                        }
+                    }
                     Ok(ClientMessage::Unsubscribe) => break,
                     Ok(ClientMessage::Subscribe { .. }) => {
                         // Re-subscribe not supported.
@@ -128,7 +160,29 @@ fn other_kind(m: &ClientMessage) -> &'static str {
         ClientMessage::Subscribe { .. } => "Subscribe",
         ClientMessage::Unsubscribe => "Unsubscribe",
         ClientMessage::CreateDenyRule { .. } => "CreateDenyRule",
+        ClientMessage::ListRules => "ListRules",
+        ClientMessage::SetRuleEnabled { .. } => "SetRuleEnabled",
+        ClientMessage::GetStats => "GetStats",
     }
+}
+
+/// Build the wire-facing rule list (disabled rules included) for the TUI.
+fn list_rule_infos(dir: &Path) -> Vec<RuleInfo> {
+    rules::list_all(dir)
+        .into_iter()
+        .map(|loaded| RuleInfo {
+            id: loaded.id,
+            priority: loaded.rule.priority,
+            enabled: loaded.rule.enabled,
+            action: match loaded.rule.action {
+                rules::Action::Allow => RuleAction::Allow,
+                rules::Action::Deny => RuleAction::Deny,
+            },
+            duration: loaded.rule.duration.as_str().to_string(),
+            matches: loaded.rule.matches.iter().map(|m| m.summary()).collect(),
+            path: loaded.path.to_string_lossy().into_owned(),
+        })
+        .collect()
 }
 
 fn matches_filter(msg: &ServerMessage, filter: Option<&dadophoros_proto::EventFilter>) -> bool {
@@ -190,8 +244,7 @@ fn write_deny_rule(
     }
 
     if !dir.exists() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
 
     let mut matches = Vec::with_capacity(2);
@@ -403,15 +456,7 @@ mod tests {
     #[test]
     fn write_deny_rule_ip_without_ip_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let err = write_deny_rule(
-            dir.path(),
-            None,
-            None,
-            None,
-            443,
-            DenyRuleKind::Ip,
-        )
-        .unwrap_err();
+        let err = write_deny_rule(dir.path(), None, None, None, 443, DenyRuleKind::Ip).unwrap_err();
         assert!(err.to_string().contains("dest_ip"));
     }
 

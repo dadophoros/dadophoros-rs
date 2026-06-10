@@ -1,6 +1,7 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -140,6 +141,139 @@ pub fn load_dir(dir: &Path) -> Vec<Rule> {
     }
     rules.sort_by_key(|r| r.priority);
     rules
+}
+
+/// A parsed rule paired with the file it came from and its effective id.
+/// Unlike [`load_dir`], `list_all` keeps disabled rules — the Rules view needs
+/// to show them so the user can flip them back on.
+#[derive(Debug, Clone)]
+pub struct LoadedRule {
+    pub id: String,
+    pub rule: Rule,
+    pub path: PathBuf,
+}
+
+/// The id a rule is addressed by: its explicit `id` field, or the file stem.
+fn effective_id(rule: &Rule, path: &Path) -> String {
+    rule.id.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_owned()
+    })
+}
+
+/// Every parsable rule under `dir`, disabled included, sorted by priority then
+/// id for a stable display order. Unparsable files are skipped (and warned),
+/// matching [`load_dir`]'s leniency.
+pub fn list_all(dir: &Path) -> Vec<LoadedRule> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "rules directory unreadable");
+            return out;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "could not read rule file");
+                continue;
+            }
+        };
+        match toml::from_str::<Rule>(&contents) {
+            Ok(rule) => {
+                let id = effective_id(&rule, &path);
+                out.push(LoadedRule { id, rule, path });
+            }
+            Err(e) => warn!(path = %path.display(), error = %e, "rule parse failed"),
+        }
+    }
+    out.sort_by(|a, b| {
+        a.rule
+            .priority
+            .cmp(&b.rule.priority)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// Rewrite the `enabled` flag of the rule with the given effective id, leaving
+/// the rest of the file (comments, ordering, formatting) intact. The daemon's
+/// notify watcher then reloads the active set. Returns the file touched.
+pub fn set_enabled(dir: &Path, id: &str, enabled: bool) -> Result<PathBuf> {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let Ok(rule) = toml::from_str::<Rule>(&contents) else {
+            continue;
+        };
+        if effective_id(&rule, &path) != id {
+            continue;
+        }
+        let mut doc = contents
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("parsing {} for edit", path.display()))?;
+        doc["enabled"] = toml_edit::value(enabled);
+        std::fs::write(&path, doc.to_string())
+            .with_context(|| format!("writing {}", path.display()))?;
+        return Ok(path);
+    }
+    Err(anyhow!("no rule with id {id}"))
+}
+
+impl Duration {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Duration::Once => "once",
+            Duration::Session => "session",
+            Duration::Persistent => "persistent",
+        }
+    }
+}
+
+impl Match {
+    /// A compact human-readable summary, e.g. `dest_host suffix .example.com`.
+    pub fn summary(&self) -> String {
+        let field = match self.field {
+            MatchField::ProcessPath => "process_path",
+            MatchField::DestHost => "dest_host",
+            MatchField::DestIp => "dest_ip",
+            MatchField::DestPort => "dest_port",
+        };
+        let op = match self.op {
+            MatchOp::Exact => "exact",
+            MatchOp::Prefix => "prefix",
+            MatchOp::Suffix => "suffix",
+            MatchOp::Contains => "contains",
+            MatchOp::In => "in",
+        };
+        let value = match &self.value {
+            MatchValue::Num(n) => n.to_string(),
+            MatchValue::Str(s) => s.clone(),
+            MatchValue::NumList(v) => v
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            MatchValue::StrList(v) => v.join(","),
+        };
+        format!("{field} {op} {value}")
+    }
 }
 
 pub fn evaluate(
@@ -514,6 +648,139 @@ priority = 1
     }
 
     #[test]
+    fn list_all_includes_disabled_and_carries_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(
+            dir.path(),
+            "off.toml",
+            r#"
+priority = 10
+enabled = false
+action = "deny"
+"#,
+        );
+        write_rule(
+            dir.path(),
+            "on.toml",
+            r#"
+priority = 5
+action = "allow"
+"#,
+        );
+        let all = list_all(dir.path());
+        assert_eq!(all.len(), 2);
+        // Sorted by priority ascending: on (5) before off (10).
+        assert_eq!(all[0].id, "on");
+        assert_eq!(all[1].id, "off");
+        assert!(!all[1].rule.enabled);
+        assert!(all[1].path.ends_with("off.toml"));
+    }
+
+    #[test]
+    fn list_all_uses_explicit_id_over_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(
+            dir.path(),
+            "file-stem.toml",
+            r#"
+id = "explicit-id"
+action = "allow"
+"#,
+        );
+        let all = list_all(dir.path());
+        assert_eq!(all[0].id, "explicit-id");
+    }
+
+    #[test]
+    fn set_enabled_flips_flag_and_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(
+            dir.path(),
+            "r.toml",
+            r#"# keep this comment
+id = "r"
+priority = 50
+enabled = true
+action = "deny"
+
+[[match]]
+type = "dest_host"
+op = "suffix"
+value = ".example.com"
+"#,
+        );
+        let path = set_enabled(dir.path(), "r", false).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("enabled = false"));
+        // Untouched content survives.
+        assert!(body.contains("# keep this comment"));
+        assert!(body.contains(".example.com"));
+        // load_dir now filters it out; list_all still sees it.
+        assert!(load_dir(dir.path()).is_empty());
+        assert_eq!(list_all(dir.path()).len(), 1);
+
+        // And back on.
+        set_enabled(dir.path(), "r", true).unwrap();
+        assert_eq!(load_dir(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn set_enabled_adds_flag_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `enabled` key -> defaults to true. Disabling must insert one.
+        write_rule(
+            dir.path(),
+            "r.toml",
+            r#"
+id = "r"
+action = "allow"
+"#,
+        );
+        set_enabled(dir.path(), "r", false).unwrap();
+        assert!(load_dir(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn set_enabled_matches_by_file_stem_when_no_explicit_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(
+            dir.path(),
+            "stem-id.toml",
+            r#"
+action = "deny"
+"#,
+        );
+        set_enabled(dir.path(), "stem-id", false).unwrap();
+        assert!(load_dir(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn set_enabled_unknown_id_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(dir.path(), "r.toml", "action = \"allow\"\n");
+        let err = set_enabled(dir.path(), "nope", false).unwrap_err();
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn match_summary_formats_each_value_kind() {
+        let s = m(
+            MatchField::DestHost,
+            MatchOp::Suffix,
+            MatchValue::Str(".example.com".into()),
+        )
+        .summary();
+        assert_eq!(s, "dest_host suffix .example.com");
+        let p = m(
+            MatchField::DestPort,
+            MatchOp::In,
+            MatchValue::NumList(vec![80, 443]),
+        )
+        .summary();
+        assert_eq!(p, "dest_port in 80,443");
+    }
+
+    #[test]
     fn load_dir_ignores_non_toml_files() {
         let dir = tempfile::tempdir().unwrap();
         write_rule(
@@ -577,7 +844,14 @@ value = [80, 443]
         assert_eq!(v.rule_id, "apt-https");
 
         // Misses: wrong port.
-        assert!(evaluate(&rules, Some("/usr/bin/apt"), Some("archive.ubuntu.com"), None, 22).is_none());
+        assert!(evaluate(
+            &rules,
+            Some("/usr/bin/apt"),
+            Some("archive.ubuntu.com"),
+            None,
+            22
+        )
+        .is_none());
         // Misses: wrong exe.
         assert!(evaluate(
             &rules,
